@@ -1,0 +1,42 @@
+# NiftySignalBot — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Zerodha Kite Connect API
+kiteconnect==5.0.1
+
+# NSE option chain data
+nsepython==2.97
+
+# Telegram bot for alerts
+python-telegram-bot==20.7
+
+# Data manipulation
+pandas==2.2.2
+numpy==1.26.4
+
+# Yahoo Finance — free 1H OHLCV for chart signals (no auth needed)
+yfinance>=0.2.36
+
+# NOTE: pandas-ta removed — EMA/RSI implemented natively in chart_signals.py
+#       (avoids pandas 2.x compatibility issues on Python 3.11)
+
+# Environment variable management
+python-dotenv==1.0.1
+
+# Job scheduler (APScheduler v3 — stable)
+APScheduler==3.10.4
+
+# HTTP retries
+requests==2.31.0
+urllib3==2.2.1
+
+# TLS fingerprint impersonation (Chrome-like) — helps bypass Akamai on NSE
+curl_cffi>=0.6.0
+
+# Headless browser — only reliable way to get NSE option chain data
+# (NSE's Akamai JS challenge requires real JS execution to set 'nsit' cookie)
+# After install run: python -m playwright install chromium
+playwright>=1.40.0
+
+# Timezone support
+pytz==2024.1
