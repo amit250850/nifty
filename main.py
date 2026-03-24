@@ -1,22 +1,31 @@
 """
 main.py — NiftySignalBot Entry Point
 
-Signal-only options alert system for NIFTY and BANKNIFTY.
-NO auto order execution — all signals are sent to Telegram for manual trading.
+Signal-only options alert system for NIFTY, BANKNIFTY, SILVERM, GOLDM.
+Signals are sent to Telegram for manual trading.
+
+AUTO-EXECUTE MODE (optional — controlled by gtt_manager.ENABLE_AUTO_EXECUTE):
+  When enabled, a BUY order + OCO GTT (SL + Target) is placed automatically
+  ONLY when ALL four guards pass simultaneously:
+      Guard 1 — Conviction  : HIGH (4/4 signals agree)
+      Guard 2 — PCR         : ideal for direction
+      Guard 3 — Budget      : available margin ≥ lot cost
+      Guard 4 — Liquidity   : bid-ask spread ≤ 5% of premium
+  If any guard fails → manual alert only, no order.
 
 Architecture:
-  • APScheduler runs scan_and_signal() every 5 minutes, 9:15 AM – 3:30 PM IST.
+  • APScheduler runs scan_and_signal() every 5 minutes, 9:00 AM – 11:30 PM IST.
   • Each cycle:
-      1. Scan option chain (NIFTY + BANKNIFTY) via nsepython.
-      2. Compute chart signals (EMA/RSI/VWAP/SuperTrend) via yfinance (free).
-      3. If conviction ≥ MEDIUM: select strike using NSE chain LTP (free),
-         send Telegram alert, log to CSV.
-      4. If conviction = NO TRADE: skip silently.
-  • Kite is used only for: session validation + NFO instrument list (expiry lookup).
-  • Kite token expiry is caught gracefully — warning logged, cycle skips.
+      1. Scan option chain via Kite Connect NFO API (NIFTY/BANKNIFTY) or
+         MCX spot-only (SILVERM/GOLDM).
+      2. Record OI snapshot in SQLite (NIFTY/BANKNIFTY only).
+      3. Compute chart signals (EMA/RSI/VWAP/SuperTrend) via Kite + yfinance.
+      4. If conviction ≥ MEDIUM: select strike, run all guards, send alert.
+      5. If all 4 guards pass: auto-execute BUY + OCO GTT (when enabled).
+      6. Log to CSV.
 
 Usage:
-    python login.py     ← once per trading day
+    python login.py     ← once per trading day (refreshes Kite access token)
     python main.py      ← starts the bot
 """
 
@@ -38,6 +47,12 @@ from modules.chart_signals   import compute_signals
 from modules.strike_selector import select_strike
 from modules.telegram_alert  import send_full_alert, send_error_alert
 from modules.trade_logger    import log_signal, initialise_log
+from modules.position_guard  import has_open_position, check_margin, check_liquidity
+from modules.gtt_manager     import (
+    find_option_tradingsymbol, all_guards_pass, execute_trade,
+    ENABLE_AUTO_EXECUTE,
+)
+from modules.oi_tracker      import initialise_db as init_oi_db, record_snapshot, get_oi_trend
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -184,13 +199,12 @@ def scan_and_signal() -> None:
     """
     Full scan-and-signal cycle. Called every 5 minutes by APScheduler.
 
-    Data sources used:
-      • Kite Connect NFO API          → spot price, PCR, OI, MaxPain, LTP map
-                                        (replaces unreliable NSE HTTP session)
-      • yfinance                      → 1H OHLCV for EMA/RSI/VWAP/SuperTrend
-      • Kite Connect MCX API          → real MCX SILVERM futures price
-
-    No Kite historical data or Kite LTP subscription required.
+    Extended flow vs previous version:
+      • OI snapshot recorded each cycle (NIFTY/BANKNIFTY) → OI trend in alerts
+      • Duplicate position check before each alert (suppresses repeat signals)
+      • Margin check included in alert message (₹ available vs ₹ needed)
+      • Tradingsymbol looked up for liquidity check + GTT placement
+      • AUTO-EXECUTE: BUY + OCO GTT placed when all 4 guards pass (when enabled)
     """
     if not is_market_open():
         logger.info("⏸  All markets closed — skipping scan cycle.")
@@ -202,7 +216,6 @@ def scan_and_signal() -> None:
     logger.info("=" * 60)
 
     for symbol in SYMBOLS:
-        # Skip symbols whose market is currently closed
         if not is_symbol_market_open(symbol):
             logger.info("─── %s — market closed, skipping ───", symbol)
             continue
@@ -210,9 +223,6 @@ def scan_and_signal() -> None:
         logger.info("─── Processing %s ───", symbol)
 
         # ── Step 1: Option Chain ────────────────────────────────────────────
-        # Primary: Kite Connect NFO API (NIFTY/BANKNIFTY) — no NSE cookies needed
-        # Fallback: NSE HTTP session (if kite unavailable)
-        # SILVERM: spot-only via yfinance (no free MCX option chain)
         try:
             oc_data = scan_option_chain(symbol, kite=kite)
         except Exception as exc:
@@ -228,21 +238,24 @@ def scan_and_signal() -> None:
             logger.warning("[%s] Invalid spot price: %s", symbol, spot)
             continue
 
-        pcr_val    = oc_data.get("pcr")
+        pcr_val     = oc_data.get("pcr")
         maxpain_val = oc_data.get("max_pain")
         ivrank_val  = oc_data.get("iv_rank")
         logger.info(
             "[%s] Spot=%.2f  PCR=%s  MaxPain=%s  IVRank=%s",
             symbol, spot,
-            f"{pcr_val:.2f}"    if pcr_val    is not None else "N/A",
-            str(maxpain_val)    if maxpain_val is not None else "N/A",
-            f"{ivrank_val:.1f}%" if ivrank_val  is not None else "N/A",
+            f"{pcr_val:.2f}"     if pcr_val     is not None else "N/A",
+            str(maxpain_val)     if maxpain_val  is not None else "N/A",
+            f"{ivrank_val:.1f}%" if ivrank_val   is not None else "N/A",
         )
 
+        # ── Step 1b: OI snapshot (NSE only — feeds trend tracker) ──────────
+        try:
+            record_snapshot(symbol, oc_data)
+        except Exception as exc:
+            logger.debug("[%s] OI snapshot error (non-fatal): %s", symbol, exc)
+
         # ── Step 2: Chart Signals ──────────────────────────────────────────
-        # For SILVERM: uses Kite MCX historical_data (real ₹ price).
-        # For NIFTY/BANKNIFTY: uses yfinance (^NSEI / ^NSEBANK).
-        # Falls back to yfinance SI=F proxy if Kite MCX data fails.
         try:
             signal = compute_signals(symbol, kite=kite)
         except Exception as exc:
@@ -258,22 +271,35 @@ def scan_and_signal() -> None:
             symbol, signal.direction, signal.conviction, signal.signals_agreed,
         )
 
-        # ── Step 3: Strike Selection (NSE chain LTP → Kite fallback) ──────
+        # ── Step 3: Duplicate position check ──────────────────────────────
+        # If an open option position already exists for this symbol+direction,
+        # skip the alert entirely — prevents doubling into a losing trade.
+        try:
+            if has_open_position(kite, symbol, signal.direction):
+                logger.info(
+                    "[%s] ⏭  Duplicate suppressed — open %s position already exists.",
+                    symbol, signal.direction,
+                )
+                continue
+        except Exception as exc:
+            logger.debug("[%s] Position check error (non-fatal): %s", symbol, exc)
+
+        # ── Step 4: Strike Selection ───────────────────────────────────────
         try:
             strike = select_strike(
                 kite       = kite,
                 symbol     = symbol,
                 spot       = spot,
                 direction  = signal.direction,
-                oc_data    = oc_data,          # ← NSE chain LTP used first (free)
-                conviction = signal.conviction, # ← scales target: HIGH=1.5×, MEDIUM=1.2×
+                oc_data    = oc_data,
+                conviction = signal.conviction,
             )
         except KiteException as exc:
             if _is_token_expiry_error(exc):
                 msg = "⚠️  Kite access token expired. Run `python login.py` and restart."
                 logger.warning(msg)
                 send_error_alert(msg)
-                return   # abort cycle
+                return
             logger.error("[%s] Kite error in strike selection: %s", symbol, exc)
             continue
         except Exception as exc:
@@ -285,36 +311,115 @@ def scan_and_signal() -> None:
             continue
 
         logger.info(
-            "[%s] Strike: %s%s  Expiry: %s  Premium: ₹%.2f  "
-            "LotCost: ₹%.0f  Source: %s",
+            "[%s] Strike: %s%s  Expiry: %s  Premium: ₹%.2f  LotCost: ₹%.0f",
             symbol, strike.otm_strike, strike.option_type,
             strike.expiry_date, strike.premium, strike.lot_cost,
-            strike.ltp_source,
         )
 
-        # ── Step 3b: GOLDM budget filter ──────────────────────────────────
+        # ── Step 4b: GOLDM hard budget cap ────────────────────────────────
         if symbol == "GOLDM" and strike.lot_cost >= GOLDM_MAX_LOT_COST:
             logger.info(
-                "[GOLDM] Lot cost ₹%.0f ≥ ₹%.0f budget cap — skipping alert.",
-                strike.lot_cost, GOLDM_MAX_LOT_COST,
+                "[GOLDM] Lot cost ₹%.0f ≥ ₹%.0f cap — skipping.", strike.lot_cost, GOLDM_MAX_LOT_COST
             )
             continue
 
-        # ── Step 4: Telegram Alert (per-symbol window) ────────────────────
-        # NSE (NIFTY/BANKNIFTY): 9:15 AM – 3:00 PM
-        # MCX (SILVERM/GOLDM):   Full session 9:00 AM – 11:30 PM
-        if is_alert_window_for(symbol):
+        # ── Step 5: Margin check ───────────────────────────────────────────
+        margin_ok, available_margin = check_margin(kite, symbol, strike.lot_cost)
+
+        # ── Step 6: OI trend (NIFTY/BANKNIFTY only) ───────────────────────
+        oi_trend = None
+        if symbol not in MCX_SYMBOLS:
             try:
-                sent = send_full_alert(signal, strike, oc_data)
+                oi_trend = get_oi_trend(symbol)
+            except Exception as exc:
+                logger.debug("[%s] OI trend error (non-fatal): %s", symbol, exc)
+
+        # ── Step 7: Tradingsymbol lookup + liquidity check ─────────────────
+        # Required for both liquidity assessment and GTT placement.
+        exchange       = "MCX" if symbol in MCX_SYMBOLS else "NFO"
+        tradingsymbol  = None
+        liquidity_info = None
+
+        try:
+            tradingsymbol = find_option_tradingsymbol(
+                kite         = kite,
+                symbol       = symbol,
+                expiry_raw   = strike.expiry_raw,
+                strike_price = float(strike.otm_strike),
+                option_type  = strike.option_type,
+                exchange     = exchange,
+            )
+        except Exception as exc:
+            logger.debug("[%s] Tradingsymbol lookup error (non-fatal): %s", symbol, exc)
+
+        if tradingsymbol:
+            try:
+                liquidity_info = check_liquidity(kite, tradingsymbol, exchange)
+            except Exception as exc:
+                logger.debug("[%s] Liquidity check error (non-fatal): %s", symbol, exc)
+
+        liquid = liquidity_info.get("liquid", True) if liquidity_info else True
+
+        # ── Step 8: Evaluate auto-execute guards ───────────────────────────
+        # PCR ideal check (reuse telegram_alert logic for consistency)
+        from modules.telegram_alert import evaluate_pcr
+        pcr_ideal = True   # default for MCX (no PCR)
+        if pcr_val is not None:
+            pcr_ideal = evaluate_pcr(pcr_val, signal.direction)["ideal"]
+
+        auto_ok, auto_reason = all_guards_pass(
+            conviction = signal.conviction,
+            pcr_ideal  = pcr_ideal,
+            margin_ok  = margin_ok,
+            liquid     = liquid,
+            exchange   = exchange,
+        )
+
+        # ── Step 9: Telegram Alert ─────────────────────────────────────────
+        trade_result = None
+        if is_alert_window_for(symbol):
+            # Build the extra_info dict for the alert formatter
+            extra_info = {
+                "available_margin": available_margin,
+                "liquidity":        liquidity_info,
+                "oi_trend":         oi_trend,
+                "auto_ok":          auto_ok,
+                "auto_reason":      auto_reason,
+                "tradingsymbol":    tradingsymbol,
+                "auto_exec_armed":  ENABLE_AUTO_EXECUTE,
+            }
+            try:
+                sent = send_full_alert(signal, strike, oc_data, extra_info=extra_info)
                 logger.info("[%s] %s Telegram alert.", symbol,
                             "✅" if sent else "⚠️  Failed to send")
             except Exception as exc:
                 logger.error("[%s] Telegram error: %s", symbol, exc)
+
+            # ── Step 10: Auto-execute (all 4 guards must pass) ────────────
+            if auto_ok and tradingsymbol and ENABLE_AUTO_EXECUTE:
+                try:
+                    trade_result = execute_trade(
+                        kite          = kite,
+                        tradingsymbol = tradingsymbol,
+                        exchange      = exchange,
+                        lot_size      = strike.lot_size,
+                        ltp           = strike.premium,
+                        sl_price      = strike.stop_loss,
+                        target_price  = strike.target,
+                        symbol        = symbol,
+                    )
+                    if trade_result:
+                        from modules.telegram_alert import send_alert
+                        send_alert(trade_result["message"])
+                        logger.info("[%s] Auto-execute result: %s", symbol, trade_result["message"])
+                except Exception as exc:
+                    logger.error("[%s] Auto-execute error: %s", symbol, exc)
+
         else:
             window_hint = "9:15 AM–3:00 PM" if symbol not in MCX_SYMBOLS else "9:00 AM–11:30 PM"
             logger.info("[%s] ⏰ Outside alert window (%s) — signal logged only.", symbol, window_hint)
 
-        # ── Step 5: Log to CSV ─────────────────────────────────────────────
+        # ── Step 11: Log to CSV ────────────────────────────────────────────
         try:
             logged = log_signal(signal, strike, oc_data)
             logger.info("[%s] %s CSV log.", symbol,
@@ -322,8 +427,7 @@ def scan_and_signal() -> None:
         except Exception as exc:
             logger.error("[%s] Logging error: %s", symbol, exc)
 
-        # Brief pause between symbols to respect NSE rate limits
-        time.sleep(2)
+        time.sleep(2)   # rate-limit between symbols
 
     logger.info("✔  Scan cycle complete.\n")
 
@@ -373,6 +477,10 @@ def print_banner() -> None:
     print(f"  Chart data: yfinance (^NSEI, ^NSEBANK) + Kite MCX historical")
     print(f"  OC + LTP  : Kite Connect NFO API (NIFTY/BANKNIFTY) | MCX: spot-only")
     print(f"  Budget    : NIFTY/BANKNIFTY ₹10k–₹20k/lot | SILVERM ~₹5k–₹15k | GOLDM <₹50k/lot")
+    print(f"  Guards    : Duplicate check | Margin | Liquidity | Conviction+PCR")
+    exec_status = "⚡ ENABLED" if ENABLE_AUTO_EXECUTE else "🔒 DISABLED (alert-only)"
+    print(f"  Auto-exec : {exec_status}")
+    print(f"  OI Tracker: data/oi_tracker.db (20-min rolling trend)")
     print(f"  Log file  : trade_log.csv")
     print("=" * 60 + "\n")
 
@@ -395,6 +503,16 @@ def main() -> None:
 
     initialise_log()
     logger.info("Trade log: %s", os.path.abspath("trade_log.csv"))
+
+    init_oi_db()
+    logger.info("OI tracker DB ready.")
+
+    if ENABLE_AUTO_EXECUTE:
+        logger.warning(
+            "⚡ AUTO-EXECUTE is ENABLED — BUY orders will be placed when all guards pass!"
+        )
+    else:
+        logger.info("🔒 Auto-execute is DISABLED — alert-only mode.")
 
     # Immediate scan on startup if market is open
     if is_market_open():

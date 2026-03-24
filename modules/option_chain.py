@@ -423,12 +423,17 @@ def _scan_nse_via_kite(symbol: str, kite) -> Optional[dict]:
     # Kite quotes don't include IV → skip IV rank (set to None)
     expiry_str = f"{expiry.day} {expiry.strftime('%b %Y')}"
 
+    total_call_oi = int(df["ce_oi"].sum())
+    total_put_oi  = int(df["pe_oi"].sum())
+
     result = {
         "symbol":             symbol,
         "underlying":         round(spot, 2),
         "expiry":             expiry_str,
         "pcr":                pcr,
         "pcr_trend":          pcr_trend_label(pcr),
+        "call_oi":            total_call_oi,   # total call OI (for OI trend tracker)
+        "put_oi":             total_put_oi,    # total put  OI (for OI trend tracker)
         "max_call_oi_strike": max_oi["max_call_oi_strike"],
         "max_put_oi_strike":  max_oi["max_put_oi_strike"],
         "call_oi_changes":    oi_changes["call_oi_changes"],

@@ -99,26 +99,33 @@ def _signal_tick(is_bullish: bool, direction: str) -> str:
 
 
 def format_alert_message(
-    signal:  SignalResult,
-    strike:  StrikeInfo,
-    oc_data: dict,
+    signal:     SignalResult,
+    strike:     StrikeInfo,
+    oc_data:    dict,
+    extra_info: dict = None,
 ) -> str:
     """
     Compose the full Telegram alert message.
 
-    Includes a PCR IDEAL / NOT IDEAL section so the trader knows
-    at a glance whether the option chain confirms the signal.
-
     Args:
-        signal:  SignalResult from chart_signals module.
-        strike:  StrikeInfo from strike_selector module.
-        oc_data: Option chain dict from option_chain module.
+        signal:     SignalResult from chart_signals module.
+        strike:     StrikeInfo from strike_selector module.
+        oc_data:    Option chain dict from option_chain module.
+        extra_info: Optional dict with keys:
+                      available_margin (float|None)
+                      liquidity        (dict|None)
+                      oi_trend         (dict|None)
+                      auto_ok          (bool)
+                      auto_reason      (str)
+                      tradingsymbol    (str|None)
+                      auto_exec_armed  (bool)
 
     Returns:
         Formatted plain-text message string.
     """
-    direction = signal.direction
-    emoji     = _direction_emoji(direction)
+    extra_info = extra_info or {}
+    direction  = signal.direction
+    emoji      = _direction_emoji(direction)
 
     # ── DTE display ───────────────────────────────────────────────────────
     dte = getattr(strike, "days_to_expiry", None)
@@ -135,6 +142,18 @@ def format_alert_message(
         sl_pct_label  = "40%"
         theta_warning = ""
 
+    # ── Margin line ────────────────────────────────────────────────────────
+    avail_margin = extra_info.get("available_margin")
+    if avail_margin is not None:
+        margin_ok  = avail_margin >= strike.lot_cost
+        margin_ico = "✅" if margin_ok else "⚠️"
+        margin_line = (
+            f"\n💰 Margin: ₹{avail_margin:,.0f} available | "
+            f"₹{strike.lot_cost:,.0f} needed {margin_ico}"
+        )
+    else:
+        margin_line = ""
+
     # ── Header ────────────────────────────────────────────────────────────
     header = (
         f"🔔 {signal.symbol} SIGNAL — {signal.conviction} CONVICTION\n"
@@ -144,6 +163,7 @@ def format_alert_message(
         f"Premium: ₹{strike.premium:,.0f} | Lot Cost: ₹{strike.lot_cost:,.0f}\n"
         f"Stop Loss: ₹{strike.stop_loss:,.0f} ({sl_pct_label} of premium){theta_warning}\n"
         f"Target: ₹{strike.target:,.0f} ({'1.5×' if signal.conviction == 'HIGH' else '1.2×'} premium — {signal.conviction})"
+        f"{margin_line}"
     )
 
     # ── PCR validation section ────────────────────────────────────────────
@@ -253,9 +273,63 @@ def format_alert_message(
     iv_rank = oc_data.get("iv_rank", None)
     iv_line = f"\n📐 IV Rank: {iv_rank:.1f}%" if iv_rank is not None else ""
 
+    # ── OI Trend section (NSE only) ────────────────────────────────────────
+    oi_trend = extra_info.get("oi_trend")
+    if oi_trend:
+        oi_trend_line = (
+            f"\n📉 OI Trend: {oi_trend['trend_emoji']} {oi_trend['trend_label']}"
+        )
+    else:
+        oi_trend_line = ""
+
+    # ── Liquidity section ──────────────────────────────────────────────────
+    liquidity = extra_info.get("liquidity")
+    if liquidity:
+        vol_str   = f" | Vol: {liquidity['volume']:,}" if liquidity.get("volume") else ""
+        liq_line  = f"\n💧 Liquidity: {liquidity['label']}{vol_str}"
+    else:
+        liq_line = ""
+
+    # ── Auto-execute / GTT section ─────────────────────────────────────────
+    auto_ok         = extra_info.get("auto_ok",         False)
+    auto_reason     = extra_info.get("auto_reason",     "")
+    auto_exec_armed = extra_info.get("auto_exec_armed", False)
+    tradingsymbol   = extra_info.get("tradingsymbol",   None)
+
+    if auto_exec_armed and auto_ok:
+        # All guards passed AND auto-execute is armed
+        gtt_line = (
+            f"\n\n⚡ AUTO-EXECUTE ARMED\n"
+            f"   BUY order + OCO GTT will be placed automatically\n"
+            f"   SL: ₹{strike.stop_loss:,.0f}  →  Target: ₹{strike.target:,.0f}\n"
+            f"   ⚠️ Check GTT IDs in Kite app after order"
+        )
+    elif not auto_exec_armed and auto_ok:
+        # All guards passed but auto-execute is disabled — show "perfect setup"
+        gtt_line = (
+            f"\n\n✅ PERFECT SETUP — All 4 guards green\n"
+            f"   Budget ✅  Liquid ✅  HIGH conviction ✅  PCR ideal ✅\n"
+            f"   Buy manually + set GTT SL ₹{strike.stop_loss:,.0f} / Target ₹{strike.target:,.0f}"
+            + (f"\n   Kite instrument: {tradingsymbol}" if tradingsymbol else "")
+        )
+    elif auto_reason:
+        # Some guard failed — show which one so trader knows why
+        gtt_line = f"\n\n🔒 Manual trade only\n   {auto_reason}"
+    else:
+        gtt_line = ""
+
     footer = f"\n\n🏁 Decision Guide\n{trade_note}"
 
-    return header + oc_section + chart_section + iv_line + footer
+    return (
+        header
+        + oc_section
+        + chart_section
+        + iv_line
+        + oi_trend_line
+        + liq_line
+        + gtt_line
+        + footer
+    )
 
 
 # ── Async send ─────────────────────────────────────────────────────────────────
@@ -291,9 +365,9 @@ def send_alert(message: str) -> bool:
 
 
 def send_full_alert(signal: SignalResult, strike: StrikeInfo,
-                    oc_data: dict) -> bool:
+                    oc_data: dict, extra_info: dict = None) -> bool:
     """Format and send a complete trade alert."""
-    message = format_alert_message(signal, strike, oc_data)
+    message = format_alert_message(signal, strike, oc_data, extra_info=extra_info)
     logger.info("[telegram_alert] Sending alert:\n%s", message)
     return send_alert(message)
 
