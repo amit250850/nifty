@@ -559,14 +559,16 @@ def select_strike(kite, symbol: str, spot: float, direction: str,
     # there is little time to recover, so exit sooner if trade moves against you.
     sl_pct      = SL_PCT_NEAR_EXPIRY if dte <= 2 else SL_PCT_DEFAULT
     target_mult = TARGET_MULT.get(conviction, 1.5)
-    lot_cost    = round(premium * lot_size,    2)
-    stop_loss   = round(premium * sl_pct,      2)
-    target      = round(premium * target_mult, 2)
+    lot_cost    = round(premium * lot_size,          2)
+    # stop_loss = EXIT PRICE at which to cut the trade (same basis as target)
+    # e.g. 30% SL on ₹4,890 premium → exit if option falls to ₹3,423, not ₹1,467
+    stop_loss   = round(premium * (1.0 - sl_pct),   2)
+    target      = round(premium * target_mult,       2)
     sl_pct_disp = int(sl_pct * 100)
 
     logger.info(
         "[strike_selector] %s%s  ₹%.2f (src=%s, %s)  DTE=%d  "
-        "LotCost=₹%.0f  SL=₹%.2f (%d%%)  Target=₹%.2f (%.1f×)  [%s]",
+        "LotCost=₹%.0f  SL=₹%.2f (exit at %d%% loss)  Target=₹%.2f (%.1f×)  [%s]",
         strike_used, option_type, premium, ltp_source, expiry_type, dte,
         lot_cost, stop_loss, sl_pct_disp, target, target_mult, conviction,
     )

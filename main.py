@@ -80,8 +80,12 @@ SCAN_INTERVAL_MINUTES  = 5
 # ── NSE hours (equity index options) ──────────────────────────────────────────
 MARKET_OPEN_H,  MARKET_OPEN_M  = 9,  15
 MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
-# NSE Telegram alerts: 9:15 AM – 3:00 PM (full NSE session, stops 30 min before close)
-ALERT_END_H, ALERT_END_M = 15, 0
+# NSE Telegram alerts: 10:00 AM – 3:00 PM
+# Skips 9:15–10:00 AM opening — first 45 min has extreme volatility, fake breakouts,
+# and algo-driven spikes that flush retail before the real trend establishes.
+# Signals fired in this window have much lower reliability.
+ALERT_START_H, ALERT_START_M = 10, 0
+ALERT_END_H,   ALERT_END_M   = 15, 0
 
 # ── MCX hours (commodity options — SILVERM/GOLDM trade until 11:30 PM IST) ────
 MCX_OPEN_H,  MCX_OPEN_M  = 9,  0
@@ -182,9 +186,9 @@ def is_alert_window_for(symbol: str) -> bool:
         close_time = now.replace(hour=MCX_CLOSE_H, minute=MCX_CLOSE_M, second=0, microsecond=0)
         return open_time <= now <= close_time
     else:
-        open_time = now.replace(hour=MARKET_OPEN_H, minute=MARKET_OPEN_M, second=0, microsecond=0)
-        alert_end = now.replace(hour=ALERT_END_H,   minute=ALERT_END_M,   second=0, microsecond=0)
-        return open_time <= now <= alert_end
+        alert_start = now.replace(hour=ALERT_START_H, minute=ALERT_START_M, second=0, microsecond=0)
+        alert_end   = now.replace(hour=ALERT_END_H,   minute=ALERT_END_M,   second=0, microsecond=0)
+        return alert_start <= now <= alert_end
 
 
 def _is_token_expiry_error(exc: Exception) -> bool:
@@ -511,7 +515,7 @@ def print_banner() -> None:
     print(f"  Mode: {exec_mode}")
     print("=" * 60)
     print(f"  Symbols   : {', '.join(SYMBOLS)}")
-    print(f"  NSE hours : 9:15 AM – 3:30 PM  | Alerts: 9:15 AM–3:00 PM")
+    print(f"  NSE hours : 9:15 AM – 3:30 PM  | Alerts: 10:00 AM–3:00 PM (skips 9:15–10:00 opening)")
     print(f"  MCX hours : 9:00 AM – 11:30 PM | Alerts: full session (SILVERM, GOLDM)")
     print(f"  Scan      : Every {SCAN_INTERVAL_MINUTES} min (Mon–Fri)")
     print(f"  Chart data: yfinance (^NSEI, ^NSEBANK) + Kite MCX historical")

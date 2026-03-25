@@ -154,6 +154,12 @@ def format_alert_message(
     else:
         margin_line = ""
 
+    # ── SL display: exit price + max loss amount ───────────────────────────
+    # stop_loss is the EXIT PRICE (e.g. ₹3,423 for a ₹4,890 entry at 30% SL)
+    # max_loss_unit = the ₹ amount you lose per share if SL is hit
+    max_loss_unit = round(strike.premium - strike.stop_loss, 0)
+    max_loss_lot  = round(max_loss_unit * strike.lot_size, 0)
+
     # ── Header ────────────────────────────────────────────────────────────
     header = (
         f"🔔 {signal.symbol} SIGNAL — {signal.conviction} CONVICTION\n"
@@ -161,7 +167,9 @@ def format_alert_message(
         f"Strike: {strike.otm_strike} {strike.option_type} (1 OTM)\n"
         f"Expiry: {strike.expiry_date} ({strike.expiry_type}{dte_label})\n"
         f"Premium: ₹{strike.premium:,.0f} | Lot Cost: ₹{strike.lot_cost:,.0f}\n"
-        f"Stop Loss: ₹{strike.stop_loss:,.0f} ({sl_pct_label} of premium){theta_warning}\n"
+        f"Stop Loss: ₹{strike.stop_loss:,.0f} exit price"
+        f" | Max loss: ₹{max_loss_unit:,.0f}/unit = ₹{max_loss_lot:,.0f}/lot ({sl_pct_label})"
+        f"{theta_warning}\n"
         f"Target: ₹{strike.target:,.0f} ({'1.5×' if signal.conviction == 'HIGH' else '1.2×'} premium — {signal.conviction})"
         f"{margin_line}"
     )
