@@ -53,6 +53,7 @@ from modules.gtt_manager     import (
     ENABLE_AUTO_EXECUTE,
 )
 from modules.oi_tracker      import initialise_db as init_oi_db, record_snapshot, get_oi_trend
+from modules.trade_monitor   import monitor_active_trades, send_eod_summary
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -214,6 +215,15 @@ def scan_and_signal() -> None:
     logger.info("=" * 60)
     logger.info("🔍  Starting scan cycle at %s", now_str)
     logger.info("=" * 60)
+
+    # ── Active trade monitor (runs every cycle before new signals) ──────────────
+    # Checks GTT status, sends exit notifications, floating P&L alerts,
+    # and applies trailing stop if the 50% target-move milestone is reached.
+    try:
+        from modules.telegram_alert import send_alert
+        monitor_active_trades(kite, send_alert)
+    except Exception as exc:
+        logger.warning("[monitor] Active trade check failed (non-fatal): %s", exc)
 
     for symbol in SYMBOLS:
         if not is_symbol_market_open(symbol):
@@ -460,6 +470,35 @@ def build_scheduler() -> BlockingScheduler:
         misfire_grace_time = 60,
         coalesce           = True,
     )
+
+    # ── End-of-Day Summary jobs ─────────────────────────────────────────────
+    # NSE: 3:20 PM — NSE closes 3:30 PM, GTTs settle by 3:20 PM
+    # MCX: 11:20 PM — MCX SILVERM/GOLDM close 11:30 PM
+    def _nse_eod():
+        from modules.telegram_alert import send_alert
+        send_eod_summary(send_alert, log_csv_path="trade_log.csv")
+
+    def _mcx_eod():
+        from modules.telegram_alert import send_alert
+        send_eod_summary(send_alert, log_csv_path="trade_log.csv")
+
+    scheduler.add_job(
+        func    = _nse_eod,
+        trigger = CronTrigger(day_of_week="mon-fri", hour=15, minute=20, timezone=IST),
+        id      = "nse_eod_summary",
+        name    = "NSE End-of-Day Summary",
+        misfire_grace_time = 120,
+        coalesce           = True,
+    )
+    scheduler.add_job(
+        func    = _mcx_eod,
+        trigger = CronTrigger(day_of_week="mon-fri", hour=23, minute=20, timezone=IST),
+        id      = "mcx_eod_summary",
+        name    = "MCX End-of-Day Summary",
+        misfire_grace_time = 120,
+        coalesce           = True,
+    )
+
     return scheduler
 
 
@@ -468,7 +507,8 @@ def build_scheduler() -> BlockingScheduler:
 def print_banner() -> None:
     print("\n" + "=" * 60)
     print("  🟢  NiftySignalBot — OPTIONS SIGNAL SYSTEM")
-    print("  ⚠️   SIGNAL ONLY — No auto execution")
+    exec_mode = "⚡ AUTO-EXECUTE + MONITOR" if ENABLE_AUTO_EXECUTE else "🔒 SIGNAL-ONLY (alert mode)"
+    print(f"  Mode: {exec_mode}")
     print("=" * 60)
     print(f"  Symbols   : {', '.join(SYMBOLS)}")
     print(f"  NSE hours : 9:15 AM – 3:30 PM  | Alerts: 9:15 AM–3:00 PM")

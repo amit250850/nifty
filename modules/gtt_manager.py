@@ -361,6 +361,25 @@ def execute_trade(
             f"   TGT Trigger : ₹{target_price:,.1f}\n"
             f"   ⚠️ Cancel GTT #{gtt['gtt_id']} in Kite if you want to exit manually"
         )
+
+        # Register trade for active monitoring (live P&L + alerts + trail stop)
+        try:
+            from modules.trade_monitor import register_trade
+            register_trade(
+                symbol        = symbol,
+                tradingsymbol = tradingsymbol,
+                exchange      = exchange,
+                direction     = "",           # caller can pass if needed
+                entry_price   = ltp,
+                lot_size      = lot_size,
+                gtt_id        = gtt["gtt_id"],
+                sl_price      = sl_price,
+                target_price  = target_price,
+                order_id      = order_id,
+            )
+        except Exception as exc:
+            logger.warning("[gtt_manager] Trade registration failed (non-fatal): %s", exc)
+
     else:
         result["message"] = (
             f"✅ BUY placed (Order: {order_id})\n"
