@@ -38,6 +38,10 @@ def _fetch_open_option_positions(kite) -> list:
     """
     Fetch all currently open option positions (non-zero net quantity) from Kite.
     Returns list of position dicts, or [] on any failure.
+
+    NOTE: kite.positions() does NOT include an 'instrument_type' field — that
+    field exists only in kite.instruments(). We derive the option type from the
+    tradingsymbol suffix ('CE' / 'PE') which is always present.
     """
     try:
         all_pos = kite.positions()
@@ -45,7 +49,10 @@ def _fetch_open_option_positions(kite) -> list:
         return [
             p for p in net
             if p.get("quantity", 0) != 0
-            and p.get("instrument_type", "") in ("CE", "PE")
+            and (
+                p.get("tradingsymbol", "").endswith("CE")
+                or p.get("tradingsymbol", "").endswith("PE")
+            )
         ]
     except Exception as exc:
         logger.warning("[position_guard] positions() failed: %s", exc)
@@ -57,7 +64,8 @@ def has_open_position(kite, symbol: str, direction: str) -> bool:
     Return True if there is an open option position for this symbol + direction.
 
     Uses a substring match on tradingsymbol so it catches all expiries/strikes
-    for the given underlying (e.g. any 'NIFTY...PE' position blocks a BUY PUT).
+    for the given underlying (e.g. any 'NIFTY...CE' position blocks a BUY CALL,
+    regardless of which strike or expiry was traded).
 
     Args:
         kite:      Authenticated KiteConnect instance.
@@ -68,13 +76,14 @@ def has_open_position(kite, symbol: str, direction: str) -> bool:
         True  → duplicate open position exists; suppress alert.
         False → clear to proceed.
     """
-    opt_type  = "CE" if "CALL" in direction else "PE"
-    open_pos  = _fetch_open_option_positions(kite)
+    opt_type = "CE" if "CALL" in direction else "PE"
+    open_pos = _fetch_open_option_positions(kite)
 
     for pos in open_pos:
         ts  = pos.get("tradingsymbol", "")
-        itype = pos.get("instrument_type", "")
-        qty   = pos.get("quantity", 0)
+        qty = pos.get("quantity", 0)
+        # Derive type from tradingsymbol suffix — the only reliable source
+        itype = "CE" if ts.endswith("CE") else ("PE" if ts.endswith("PE") else "")
         if symbol.upper() in ts.upper() and itype == opt_type:
             logger.info(
                 "[position_guard] Duplicate suppressed: existing %s qty=%d "

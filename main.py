@@ -53,7 +53,7 @@ from modules.gtt_manager     import (
     ENABLE_AUTO_EXECUTE,
 )
 from modules.oi_tracker      import initialise_db as init_oi_db, record_snapshot, get_oi_trend
-from modules.trade_monitor   import monitor_active_trades, send_eod_summary
+from modules.trade_monitor   import monitor_active_trades, monitor_unregistered_positions, send_eod_summary
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -173,12 +173,13 @@ def is_alert_window_for(symbol: str) -> bool:
     Per-symbol Telegram alert window:
 
     NSE (NIFTY, BANKNIFTY):
-      9:15 AM – 11:00 AM only — avoids notification overload all day.
+      10:00 AM – 3:00 PM — skips the first 45 minutes of opening-noise
+      algo spikes and fake breakouts (9:15–10:00 AM).
 
-    MCX (SILVERM):
-      Full MCX session 9:00 AM – 11:30 PM — silver moves happen morning
-      AND evening (US/London market open). The HIGH/MEDIUM conviction
-      threshold naturally prevents constant pinging.
+    MCX (SILVERM, GOLDM):
+      Full MCX session 9:00 AM – 11:30 PM — commodity moves happen
+      morning AND evening (US/London market open). The HIGH/MEDIUM
+      conviction threshold naturally prevents constant pinging.
     """
     now = datetime.now(IST)
     if symbol in MCX_SYMBOLS:
@@ -228,6 +229,16 @@ def scan_and_signal() -> None:
         monitor_active_trades(kite, send_alert)
     except Exception as exc:
         logger.warning("[monitor] Active trade check failed (non-fatal): %s", exc)
+
+    # ── Manual position watcher ──────────────────────────────────────────────────
+    # Watches ALL open option positions from kite.positions() — including those
+    # placed manually via Zerodha web/app that are NOT in the bot's registry.
+    # Sends P&L advisory alerts (down 25/40%, up 40/70%, trail-stop suggestion).
+    try:
+        from modules.telegram_alert import send_alert
+        monitor_unregistered_positions(kite, send_alert)
+    except Exception as exc:
+        logger.warning("[monitor] Manual position watcher failed (non-fatal): %s", exc)
 
     for symbol in SYMBOLS:
         if not is_symbol_market_open(symbol):
@@ -430,7 +441,7 @@ def scan_and_signal() -> None:
                     logger.error("[%s] Auto-execute error: %s", symbol, exc)
 
         else:
-            window_hint = "9:15 AM–3:00 PM" if symbol not in MCX_SYMBOLS else "9:00 AM–11:30 PM"
+            window_hint = "10:00 AM–3:00 PM" if symbol not in MCX_SYMBOLS else "9:00 AM–11:30 PM"
             logger.info("[%s] ⏰ Outside alert window (%s) — signal logged only.", symbol, window_hint)
 
         # ── Step 11: Log to CSV ────────────────────────────────────────────

@@ -42,6 +42,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ── In-memory alert tracker for manually-placed positions (resets on restart) ──
+# Maps tradingsymbol → set of alert codes already sent this session.
+# Prevents duplicate Telegram spam for the same threshold being hit repeatedly.
+_manual_alerts_sent: dict = {}   # e.g. {"NIFTY25MAR23500CE": {"warn_down_25", "profit_40"}}
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 REGISTRY_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -479,6 +484,170 @@ def monitor_active_trades(kite, send_alert_fn) -> None:
         updated_trades.append(trade)
 
     _save_registry(updated_trades)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Unregistered (manually placed) position watcher
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Alert thresholds for manually-placed positions
+_MANUAL_WARN_DOWN_1  = -0.25   # -25% of premium → early warning
+_MANUAL_WARN_DOWN_2  = -0.40   # -40% of premium → approaching SL territory
+_MANUAL_PROFIT_1     =  0.40   # +40% of premium → consider partial booking
+_MANUAL_PROFIT_2     =  0.70   # +70% of premium → strong exit candidate
+_MANUAL_TRAIL_ADVISE =  0.50   # +50% of premium → advise moving GTT SL to breakeven
+
+
+def _fmt_pct(pct: float) -> str:
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:.1f}%"
+
+
+def monitor_unregistered_positions(kite, send_alert_fn) -> None:
+    """
+    Watch ALL open option positions from kite.positions() — including those
+    placed manually via Zerodha web/app that are NOT in the bot's registry.
+
+    Called every scan cycle. Sends advisory Telegram alerts at key thresholds
+    so manually-placed trades get the same P&L awareness as auto-executed ones.
+
+    Alert levels per position (each fires at most ONCE per bot session):
+      ⚠️  Down 25% : Early warning — watch closely
+      🔴  Down 40% : Approaching SL territory — be ready to cut
+      💡  Up   40% : Consider booking partial profits
+      🎯  Up   70% : Strong exit candidate — protect gains
+      🔄  Up   50% : Advisory — move your GTT stop-loss to breakeven
+
+    For registered (auto-executed) trades, this function deliberately does
+    nothing — they are already handled by monitor_active_trades() with full
+    GTT control. No duplicate alerts.
+
+    Args:
+        kite:          Authenticated KiteConnect instance.
+        send_alert_fn: Callable (str) → bool — telegram_alert.send_alert.
+    """
+    global _manual_alerts_sent
+
+    # Load the registry to know which tradingsymbols are already monitored
+    registered_symbols = {t["tradingsymbol"] for t in _load_registry()}
+
+    # Fetch all open positions
+    try:
+        all_pos = kite.positions()
+        net_pos = all_pos.get("net", [])
+    except Exception as exc:
+        logger.warning("[trade_monitor] positions() failed in manual watcher: %s", exc)
+        return
+
+    # Filter: open option positions NOT already in the bot registry
+    manual_positions = [
+        p for p in net_pos
+        if p.get("quantity", 0) != 0
+        and (p.get("tradingsymbol", "").endswith("CE")
+             or p.get("tradingsymbol", "").endswith("PE"))
+        and p.get("tradingsymbol") not in registered_symbols
+    ]
+
+    if not manual_positions:
+        return
+
+    logger.info(
+        "[trade_monitor] %d manually-placed option position(s) being watched.",
+        len(manual_positions),
+    )
+
+    for pos in manual_positions:
+        ts        = pos.get("tradingsymbol", "")
+        avg_price = float(pos.get("average_price", 0) or 0)
+        ltp       = float(pos.get("last_price", 0) or 0)
+        quantity  = int(pos.get("quantity", 0))
+        unrealised = float(pos.get("unrealised", pos.get("pnl", 0)) or 0)
+
+        if avg_price <= 0 or ltp <= 0:
+            continue
+
+        pnl_pct = (ltp - avg_price) / avg_price   # as a fraction (e.g. -0.27 = -27%)
+        pnl_lot = unrealised
+
+        logger.info(
+            "[trade_monitor][manual] %s  avg=₹%.1f  ltp=₹%.1f  pnl_pct=%.1f%%  "
+            "unrealised=₹%.0f  qty=%d",
+            ts, avg_price, ltp, pnl_pct * 100, pnl_lot, quantity,
+        )
+
+        if ts not in _manual_alerts_sent:
+            _manual_alerts_sent[ts] = set()
+        sent = _manual_alerts_sent[ts]
+
+        def _try_alert(msg: str, code: str) -> None:
+            if code in sent:
+                return
+            try:
+                send_alert_fn(msg)
+                sent.add(code)
+                logger.info("[trade_monitor][manual] Alert '%s' sent for %s", code, ts)
+            except Exception as exc:
+                logger.error(
+                    "[trade_monitor][manual] Alert '%s' failed for %s: %s", code, ts, exc
+                )
+
+        # ── Down alerts ────────────────────────────────────────────────────
+        if pnl_pct <= _MANUAL_WARN_DOWN_2:
+            _try_alert(
+                f"🔴 MANUAL POSITION — APPROACHING SL ZONE\n"
+                f"Position  : {ts}\n"
+                f"Entry     : ₹{avg_price:,.1f}\n"
+                f"Current   : ₹{ltp:,.1f}  ({_fmt_pct(pnl_pct * 100)})\n"
+                f"P&L       : ₹{pnl_lot:,.0f}\n"
+                f"↳ Down 40% from entry — be ready to cut if thesis is broken",
+                "warn_down_40",
+            )
+        elif pnl_pct <= _MANUAL_WARN_DOWN_1:
+            _try_alert(
+                f"⚠️ MANUAL POSITION — WATCH CLOSELY\n"
+                f"Position  : {ts}\n"
+                f"Entry     : ₹{avg_price:,.1f}\n"
+                f"Current   : ₹{ltp:,.1f}  ({_fmt_pct(pnl_pct * 100)})\n"
+                f"P&L       : ₹{pnl_lot:,.0f}\n"
+                f"↳ Down 25% from entry — monitor closely",
+                "warn_down_25",
+            )
+
+        # ── Profit alerts ──────────────────────────────────────────────────
+        if pnl_pct >= _MANUAL_PROFIT_2:
+            _try_alert(
+                f"🎯 MANUAL POSITION — STRONG EXIT CANDIDATE\n"
+                f"Position  : {ts}\n"
+                f"Entry     : ₹{avg_price:,.1f}\n"
+                f"Current   : ₹{ltp:,.1f}  ({_fmt_pct(pnl_pct * 100)})\n"
+                f"P&L       : ₹{pnl_lot:,.0f}\n"
+                f"↳ Up 70%+ — consider exiting and protecting gains",
+                "profit_70",
+            )
+        elif pnl_pct >= _MANUAL_PROFIT_1:
+            _try_alert(
+                f"💡 MANUAL POSITION — CONSIDER PARTIAL BOOKING\n"
+                f"Position  : {ts}\n"
+                f"Entry     : ₹{avg_price:,.1f}\n"
+                f"Current   : ₹{ltp:,.1f}  ({_fmt_pct(pnl_pct * 100)})\n"
+                f"P&L       : ₹{pnl_lot:,.0f}\n"
+                f"↳ Up 40%+ — consider booking partial profits or trailing your GTT SL",
+                "profit_40",
+            )
+
+        # ── Trail-stop advisory (separate from profit alerts) ──────────────
+        if pnl_pct >= _MANUAL_TRAIL_ADVISE and "trail_advisory" not in sent:
+            new_sl_suggestion = round(avg_price, 1)
+            _try_alert(
+                f"🔄 MANUAL POSITION — TRAIL YOUR GTT STOP-LOSS\n"
+                f"Position  : {ts}\n"
+                f"Entry     : ₹{avg_price:,.1f}\n"
+                f"Current   : ₹{ltp:,.1f}  ({_fmt_pct(pnl_pct * 100)})\n"
+                f"P&L       : ₹{pnl_lot:,.0f}\n"
+                f"↳ Up 50% from entry — consider modifying your GTT SL to "
+                f"₹{new_sl_suggestion:,.1f} (breakeven) to make this trade risk-free",
+                "trail_advisory",
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

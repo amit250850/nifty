@@ -145,33 +145,77 @@ def get_otm_strike(atm: int, direction: str, symbol: str) -> int:
 
 # ── Expiry helpers ────────────────────────────────────────────────────────────
 
-def get_nearest_weekly_expiry(symbol: str) -> date:
+def get_nearest_weekly_expiry(symbol: str, kite=None) -> date:
     """
-    Calculate the nearest weekly expiry date for the given symbol.
+    Return the nearest usable weekly expiry date for the given NSE symbol.
 
-    Weekly expiry days:
-      NIFTY     → Thursday (weekday 3)
-      BANKNIFTY → Wednesday (weekday 2)
+    PRIMARY path (kite provided):
+      Reads actual expiry dates from kite.instruments("NFO") and picks the
+      nearest one with DTE ≥ MIN_DTE_DAYS.  This correctly handles exchange
+      holidays (e.g. April 2 Ram Navami, April 3 Good Friday) where NSE shifts
+      the expiry to an earlier date that pure weekday arithmetic would miss.
 
-    If today IS the expiry day, return next week's expiry
-    (avoids trading on expiry day where premiums collapse rapidly).
+    FALLBACK (kite=None or API failure):
+      Uses weekday arithmetic — Thursday for NIFTY, Wednesday for BANKNIFTY.
+      Less reliable around holidays but avoids hard dependency on live Kite data.
 
     Args:
         symbol: 'NIFTY' or 'BANKNIFTY'.
+        kite:   Authenticated KiteConnect instance (optional but strongly preferred).
 
     Returns:
-        Next weekly expiry as a Python date.
+        Next usable weekly expiry as a Python date.
     """
-    today      = date.today()
-    expiry_day = WEEKLY_EXPIRY_DAY.get(symbol, 3)   # default Thursday
-    days_ahead = (expiry_day - today.weekday()) % 7
+    today = date.today()
 
-    # Roll to next week if expiry is too close (includes expiry day itself).
-    # DTE < MIN_DTE_DAYS → not enough time value; risk of holding to near-zero.
+    # ── Primary: read real expiry dates from Kite NFO instruments ─────────────
+    if kite is not None:
+        try:
+            instruments = kite.instruments("NFO")
+            expiries = set()
+            for inst in instruments:
+                if (inst.get("name", "").upper() == symbol.upper()
+                        and inst.get("instrument_type") in ("CE", "PE")):
+                    exp = inst.get("expiry")
+                    if exp is None:
+                        continue
+                    exp_date = exp if isinstance(exp, date) else exp.date()
+                    if exp_date >= today:
+                        expiries.add(exp_date)
+
+            if expiries:
+                # Sort ascending; pick first date with DTE ≥ MIN_DTE_DAYS
+                for exp_date in sorted(expiries):
+                    dte = (exp_date - today).days
+                    if dte >= MIN_DTE_DAYS:
+                        logger.debug(
+                            "[strike_selector] %s next expiry from Kite: %s (DTE=%d)",
+                            symbol, exp_date, dte,
+                        )
+                        return exp_date
+                # All known expiries are too close — take the furthest available
+                furthest = sorted(expiries)[-1]
+                logger.warning(
+                    "[strike_selector] All %s expiries within MIN_DTE_DAYS; "
+                    "using furthest: %s", symbol, furthest,
+                )
+                return furthest
+        except Exception as exc:
+            logger.warning(
+                "[strike_selector] NFO instruments fetch failed for %s expiry "
+                "(%s) — falling back to calendar calc", symbol, exc,
+            )
+
+    # ── Fallback: weekday arithmetic ───────────────────────────────────────────
+    expiry_day = WEEKLY_EXPIRY_DAY.get(symbol, 3)   # 3=Thursday, 2=Wednesday
+    days_ahead = (expiry_day - today.weekday()) % 7
     if days_ahead < MIN_DTE_DAYS:
         days_ahead += 7
-
-    return today + timedelta(days=days_ahead)
+    fallback_date = today + timedelta(days=days_ahead)
+    logger.debug(
+        "[strike_selector] %s expiry (calendar fallback): %s", symbol, fallback_date
+    )
+    return fallback_date
 
 
 def get_nearest_mcx_monthly_expiry(kite, symbol: str = "SILVERM") -> Optional[date]:
@@ -466,7 +510,7 @@ def select_strike(kite, symbol: str, spot: float, direction: str,
             logger.error("[strike_selector] Cannot determine MCX expiry for %s", symbol)
             return None
     elif use_weekly:
-        expiry      = get_nearest_weekly_expiry(symbol)
+        expiry      = get_nearest_weekly_expiry(symbol, kite=kite)  # Kite-aware
         expiry_type = "weekly"
     else:
         expiry      = get_nearest_monthly_expiry(kite)
@@ -474,7 +518,7 @@ def select_strike(kite, symbol: str, spot: float, direction: str,
         if expiry is None:
             logger.warning("[strike_selector] Monthly expiry fetch failed, "
                            "falling back to weekly")
-            expiry      = get_nearest_weekly_expiry(symbol)
+            expiry      = get_nearest_weekly_expiry(symbol, kite=kite)
             expiry_type = "weekly"
 
     logger.info("[strike_selector] %s  Expiry: %s (%s)",
@@ -608,8 +652,8 @@ if __name__ == "__main__":
     kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
     kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
 
-    print(f"\nNext NIFTY weekly expiry     : {get_nearest_weekly_expiry('NIFTY')}")
-    print(f"Next BANKNIFTY weekly expiry : {get_nearest_weekly_expiry('BANKNIFTY')}\n")
+    print(f"\nNext NIFTY weekly expiry     : {get_nearest_weekly_expiry('NIFTY',     kite=kite)}")
+    print(f"Next BANKNIFTY weekly expiry : {get_nearest_weekly_expiry('BANKNIFTY', kite=kite)}\n")
 
     test_cases = [
         ("NIFTY",     23134.0, "BUY PUT"),
