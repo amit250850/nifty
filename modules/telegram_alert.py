@@ -261,14 +261,16 @@ def format_alert_message(
 
     else:
         # ── NSE display — standard labels ─────────────────────────────────
-        rsi_pos  = "above 50" if signal.rsi_bullish else "below 50"
-        vwap_pos = "Price above" if signal.vwap_bullish else "Price below"
+        # Note: vwap_bullish field now stores EMA50 result (VWAP replaced in chart_signals.py
+        # because yfinance index tickers return zero volume making VWAP unreliable)
+        rsi_pos   = "above 50" if signal.rsi_bullish else "below 50"
+        ema50_pos = "Above EMA50" if signal.vwap_bullish else "Below EMA50"
 
         chart_section = (
             f"\n\n📈 Chart Signals (1H)\n"
-            f"EMA:        {ema_label} {_signal_tick(signal.ema_bullish, direction)}\n"
-            f"RSI:        {signal.rsi_value:.0f} ({rsi_pos}) {_signal_tick(signal.rsi_bullish, direction)}\n"
-            f"VWAP:       {vwap_pos} {_signal_tick(signal.vwap_bullish, direction)}\n"
+            f"EMA 9/21:   {ema_label} {_signal_tick(signal.ema_bullish, direction)}\n"
+            f"RSI(14):    {signal.rsi_value:.0f} ({rsi_pos}) {_signal_tick(signal.rsi_bullish, direction)}\n"
+            f"EMA50 Trend:{ema50_pos} {_signal_tick(signal.vwap_bullish, direction)}\n"
             f"SuperTrend: {st_label} {_signal_tick(signal.supertrend_bullish, direction)}"
         )
 

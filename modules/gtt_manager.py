@@ -174,7 +174,9 @@ def place_buy_order(
             exchange        = exchange,
             transaction_type= kite.TRANSACTION_TYPE_BUY,
             quantity        = quantity,
-            product         = kite.PRODUCT_MIS,
+            product         = kite.PRODUCT_NRML,   # NRML = overnight hold allowed
+            # ⚠️  NOT MIS — backtest avg hold is 42–92h (multi-day).
+            # MIS auto-squares at 3:20 PM daily, cutting all winners short.
             order_type      = kite.ORDER_TYPE_MARKET,
             variety         = kite.VARIETY_REGULAR,
         )
@@ -263,14 +265,14 @@ def place_oco_gtt(
                 {   # Leg 1 — SL: fires when price drops to sl_price
                     "transaction_type": kite.TRANSACTION_TYPE_SELL,
                     "quantity":         quantity,
-                    "product":          kite.PRODUCT_MIS,
+                    "product":          kite.PRODUCT_NRML,   # must match buy product
                     "order_type":       kite.ORDER_TYPE_LIMIT,
                     "price":            sl_limit,
                 },
                 {   # Leg 2 — Target: fires when price rises to target_price
                     "transaction_type": kite.TRANSACTION_TYPE_SELL,
                     "quantity":         quantity,
-                    "product":          kite.PRODUCT_MIS,
+                    "product":          kite.PRODUCT_NRML,   # must match buy product
                     "order_type":       kite.ORDER_TYPE_LIMIT,
                     "price":            target_limit,
                 },

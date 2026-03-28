@@ -55,7 +55,8 @@ ATM_STEP = {
     "NIFTY":     50,
     "BANKNIFTY": 100,
     "SILVERM":   1000,  # MCX SILVERM strikes in ₹1000/kg increments
-    "GOLDM":     100,   # MCX GOLDM strikes in ₹100/10g increments
+    "GOLDM":     500,   # MCX GOLDM strikes in ₹500/10g increments
+                        # (instruments lookup overrides this if still wrong)
 }
 
 # Weekly expiry weekday (Monday=0 … Sunday=6) — NSE index options only
@@ -350,6 +351,63 @@ def build_nfo_symbol(symbol: str, expiry: date, strike: int,
     return f"{symbol}{expiry_str}{strike}{option_type}"
 
 
+def find_nearest_available_mcx_strike(
+    kite,
+    symbol:       str,
+    expiry:       date,
+    option_type:  str,
+    target_strike: int,
+) -> Optional[int]:
+    """
+    Query kite.instruments("MCX") to find the option strike closest to
+    target_strike for the given symbol, expiry, and option type.
+
+    Used as a fallback when the computed ATM/OTM strike returns no LTP —
+    this typically happens for GOLDM where MCX uses ₹500 or ₹1000 strike
+    intervals rather than the ₹100 intervals used by SILVERM.
+
+    Returns the nearest available strike, or None on failure / no data.
+    """
+    try:
+        instruments = kite.instruments(exchange=EXCHANGE_MCX)
+    except Exception as exc:
+        logger.warning(
+            "[strike_selector] MCX instruments fetch for strike lookup failed: %s", exc,
+        )
+        return None
+
+    available: list[int] = []
+    for inst in instruments:
+        if (inst.get("name") == symbol
+                and inst.get("instrument_type") == option_type):
+            exp = inst.get("expiry")
+            if exp is None:
+                continue
+            if isinstance(exp, datetime):
+                exp = exp.date()
+            if exp == expiry:
+                s = inst.get("strike")
+                if s is not None:
+                    available.append(int(float(s)))
+
+    if not available:
+        logger.warning(
+            "[strike_selector] No %s %s option instruments found for expiry %s in Kite MCX list",
+            symbol, option_type, expiry,
+        )
+        return None
+
+    available.sort()
+    nearest = min(available, key=lambda s: abs(s - target_strike))
+    nearby = [s for s in available
+              if abs(s - target_strike) <= 5 * ATM_STEP.get(symbol, 100)]
+    logger.info(
+        "[strike_selector] %s available %s strikes near %d: %s → using %d",
+        symbol, option_type, target_strike, nearby or available[:6], nearest,
+    )
+    return nearest
+
+
 def build_mcx_symbol(symbol: str, expiry: date, strike: int,
                      option_type: str) -> str:
     """
@@ -554,6 +612,8 @@ def select_strike(kite, symbol: str, spot: float, direction: str,
 
         if is_mcx:
             # Try 1-strike OTM first; fall back to ATM if OTM has no liquidity.
+            # If both fail, query MCX instruments to find the actual strike spacing
+            # (e.g. GOLDM uses ₹500 intervals, not ₹100) and try the nearest real strike.
             otm     = atm + step * otm_direction
             otm_sym = build_mcx_symbol(symbol, expiry, otm, option_type)
             premium = fetch_ltp_from_kite(kite, otm_sym, exchange=exchange)
@@ -573,6 +633,27 @@ def select_strike(kite, symbol: str, spot: float, direction: str,
                     logger.info("[strike_selector] %s OTM no LTP — using ATM: "
                                 "%d%s  ₹%.2f  lot=₹%.0f",
                                 symbol, atm, option_type, premium, premium * lot_size)
+                else:
+                    # Both OTM and ATM failed — computed step size is wrong.
+                    # Query MCX instruments to find the actual available strikes.
+                    logger.info(
+                        "[strike_selector] %s OTM+ATM both empty — querying MCX instruments "
+                        "to discover real strike spacing …", symbol,
+                    )
+                    real_strike = find_nearest_available_mcx_strike(
+                        kite, symbol, expiry, option_type, atm,
+                    )
+                    if real_strike is not None:
+                        real_sym = build_mcx_symbol(symbol, expiry, real_strike, option_type)
+                        premium  = fetch_ltp_from_kite(kite, real_sym, exchange=exchange)
+                        if premium and premium > 0:
+                            ltp_source  = "kite_api"
+                            strike_used = real_strike
+                            trading_sym = real_sym
+                            logger.info(
+                                "[strike_selector] ✅ %s real strike: %d%s  ₹%.2f  lot=₹%.0f",
+                                symbol, real_strike, option_type, premium, premium * lot_size,
+                            )
 
         else:
             # NFO: try 1-strike OTM then ATM

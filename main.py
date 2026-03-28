@@ -77,6 +77,24 @@ ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
 SYMBOLS                = ["NIFTY", "BANKNIFTY", "SILVERM", "GOLDM"]
 SCAN_INTERVAL_MINUTES  = 5
 
+# ── Per-symbol minimum conviction for sending alerts ───────────────────────────
+# Derived from 60-day backtest (DTE≥3, SL cooldown, --no-vix):
+#
+#   NIFTY HIGH   : 18 trades, 61.1% win, +₹26,682  ← trade
+#   NIFTY MEDIUM :  9 trades, 66.7% win, +₹15,712  ← trade (MEDIUM actually better!)
+#   BANKNIFTY HIGH : 16 trades, 43.8% win, +₹17,002  ← trade (R:R saves it in trends)
+#   BANKNIFTY MEDIUM: 11 trades, 45.5% win, +₹968  ← SKIP (₹88/trade avg, not worth it)
+#
+# BANKNIFTY MEDIUM is barely breakeven (+₹968 over 60 days) and generates
+# consecutive SL streaks in choppy markets. HIGH only for BANKNIFTY.
+# NIFTY signals are consistently reliable at both conviction levels.
+SYMBOL_MIN_CONVICTION: dict[str, str] = {
+    "NIFTY":     "MEDIUM",   # Both HIGH and MEDIUM are profitable
+    "BANKNIFTY": "HIGH",     # MEDIUM gives only +₹968/60 days — skip
+    "SILVERM":   "MEDIUM",   # No backtest data yet — default to MEDIUM
+    "GOLDM":     "MEDIUM",   # No backtest data yet — default to MEDIUM
+}
+
 # ── NSE hours (equity index options) ──────────────────────────────────────────
 MARKET_OPEN_H,  MARKET_OPEN_M  = 9,  15
 MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
@@ -296,6 +314,20 @@ def scan_and_signal() -> None:
             symbol, signal.direction, signal.conviction, signal.signals_agreed,
         )
 
+        # ── Step 2b: Per-symbol conviction gate ────────────────────────────
+        # Backtest (60 days) shows BANKNIFTY MEDIUM gives only +₹968 over 60
+        # days (45.5% win, ₹88 avg/trade) vs NIFTY MEDIUM at 66.7% / +₹15,712.
+        # Skip below-threshold conviction signals to reduce noise and SL churn.
+        _min_conv = SYMBOL_MIN_CONVICTION.get(symbol, "MEDIUM")
+        _conv_rank = {"MEDIUM": 1, "HIGH": 2}
+        if _conv_rank.get(signal.conviction, 0) < _conv_rank.get(_min_conv, 1):
+            logger.info(
+                "[%s] ⏭  Conviction gate — got %s but min required is %s. "
+                "BANKNIFTY MEDIUM: +₹968/60 days (45.5%% win) — not worth trading.",
+                symbol, signal.conviction, _min_conv,
+            )
+            continue
+
         # ── Step 3: Duplicate position check ──────────────────────────────
         # If an open option position already exists for this symbol+direction,
         # skip the alert entirely — prevents doubling into a losing trade.
@@ -341,7 +373,31 @@ def scan_and_signal() -> None:
             strike.expiry_date, strike.premium, strike.lot_cost,
         )
 
-        # ── Step 4b: GOLDM hard budget cap ────────────────────────────────
+        # ── Step 4b: DTE guard — only trade Monday/Friday ──────────────────
+        # Backtest (60 days, 114 HIGH signals) win rate by DTE:
+        #   DTE 0  (expiry day):  ~0%  win rate — theta trap
+        #   DTE 1  (Wed/Thu):     17%  win rate — not viable
+        #   DTE 2  (Tue):         24%  win rate — not viable
+        #   DTE 3+ (Mon/Fri):     50-55% win rate — profitable
+        # Only enter when option has at least 3 calendar days to expiry.
+        # This means Monday (DTE≈3) and Friday (DTE≈6) entries only.
+        _MIN_DTE = 3
+        _today = datetime.now(IST).date()
+        try:
+            _expiry_date = strike.expiry_raw.date() if hasattr(strike.expiry_raw, "date") else strike.expiry_raw
+            _dte = (_expiry_date - _today).days
+        except Exception:
+            _dte = 999   # unknown — allow through safely
+        if _dte < _MIN_DTE:
+            logger.info(
+                "[%s] ⏭  DTE=%d < %d — skipping (Tue/Wed/Thu entry). "
+                "Strategy only trades Mon/Fri (DTE≥3). "
+                "Backtest: DTE<3 has <25%% win rate. Expiry: %s",
+                symbol, _dte, _MIN_DTE, strike.expiry_date,
+            )
+            continue
+
+        # ── Step 4c: GOLDM hard budget cap ────────────────────────────────
         if symbol == "GOLDM" and strike.lot_cost >= GOLDM_MAX_LOT_COST:
             logger.info(
                 "[GOLDM] Lot cost ₹%.0f ≥ ₹%.0f cap — skipping.", strike.lot_cost, GOLDM_MAX_LOT_COST

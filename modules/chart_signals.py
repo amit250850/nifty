@@ -542,13 +542,19 @@ def compute_signals(symbol: str, kite=None) -> Optional[SignalResult]:
             rsi_value, ema_bullish, st_bullish,
         )
 
-    # ── NSE path: VWAP + standard RSI threshold ────────────────────────────
-    df["vwap"]   = compute_vwap(df)
-    last_vwap    = _last_valid(df["vwap"], fallback=last_close)
-    vwap_bullish = last_close > last_vwap
-    rsi_bullish  = rsi_value > 50
+    # ── NSE path: EMA50 trend + standard RSI threshold ─────────────────────
+    # NOTE: VWAP was replaced with EMA50 because yfinance index tickers
+    # (^NSEI / ^NSEBANK) return zero volume → VWAP = NaN → always votes
+    # bearish via fallback → HIGH BUY CALL signals could never fire.
+    # EMA50 is a causal, volume-independent trend filter (same approach
+    # already used for MCX commodities) and gives the 4th indicator real
+    # signal power for both directions.
+    df["ema50"]    = compute_ema(df["close"], EMA_TREND)
+    last_ema50     = _last_valid(df["ema50"], fallback=last_close)
+    ema50_bullish  = last_close > last_ema50
+    rsi_bullish    = rsi_value > 50
 
-    bullish_count = sum([ema_bullish, rsi_bullish, vwap_bullish, st_bullish])
+    bullish_count = sum([ema_bullish, rsi_bullish, ema50_bullish, st_bullish])
     bearish_count = 4 - bullish_count
 
     if   bullish_count == 4: direction, conviction = "BUY CALL", "HIGH"
@@ -572,20 +578,21 @@ def compute_signals(symbol: str, kite=None) -> Optional[SignalResult]:
         ema_bullish        = ema_bullish,
         rsi_value          = rsi_value,
         rsi_bullish        = rsi_bullish,
-        vwap_bullish       = vwap_bullish,
+        vwap_bullish       = ema50_bullish,   # field reused — stores EMA50 result for NSE
         supertrend_bullish = st_bullish,
         last_close         = round(last_close, 2),
-        last_vwap          = round(last_vwap,  2),
+        last_vwap          = round(last_ema50, 2),   # field reused — stores EMA50 value for NSE
         last_ema9          = round(last_ema9,  2),
         last_ema21         = round(last_ema21, 2),
         is_mcx             = False,
     )
 
     logger.info(
-        "[chart_signals] %s → %s | %s | EMA=%s RSI=%.1f VWAP=%.2f ST=%s  [src=%s]",
+        "[chart_signals] %s → %s | %s | EMA9/21=%s RSI=%.1f EMA50=%s ST=%s  [src=%s]",
         symbol, direction, conviction,
         "✅" if ema_bullish else "❌",
-        rsi_value, last_vwap,
+        rsi_value,
+        "✅" if ema50_bullish else "❌",
         "✅" if st_bullish else "❌",
         data_src,
     )
