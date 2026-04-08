@@ -192,8 +192,9 @@ def check_liquidity(kite, tradingsymbol: str, exchange: str = "NFO") -> dict:
     default  = {
         "ltp": 0.0, "best_bid": 0.0, "best_ask": 0.0,
         "spread": 0.0, "spread_pct": 0.0,
-        "liquid": True, "volume": 0,
-        "label": "ℹ️ Liquidity data unavailable",
+        "liquid": False,   # fail-safe: unknown depth = do NOT auto-execute
+        "volume": 0,
+        "label": "⚠️ Liquidity data unavailable — auto-execute blocked, verify manually",
     }
 
     try:
@@ -217,24 +218,28 @@ def check_liquidity(kite, tradingsymbol: str, exchange: str = "NFO") -> dict:
         else:
             spread = spread_pct = 0.0
 
-        liquid = spread_pct <= SPREAD_WARN_PCT
-
         if spread_pct == 0.0:
-            label = "ℹ️ Depth unavailable — verify liquidity manually"
-        elif spread_pct > SPREAD_BLOCK_PCT:
-            label = (
-                f"⛔ Very illiquid (spread ₹{spread:.1f} = {spread_pct:.1f}% of premium)"
-                f" — consider skipping or adjusting strike"
-            )
-        elif spread_pct > SPREAD_WARN_PCT:
-            label = (
-                f"⚠️ Thin liquidity (spread ₹{spread:.1f} = {spread_pct:.1f}% of premium)"
-                f" — use limit order, not market"
-            )
+            # No bid/ask data returned — depth is empty or strike has no quotes.
+            # Treat as illiquid: block auto-execute, let human verify.
+            liquid = False
+            label  = "⚠️ Depth unavailable — auto-execute blocked, verify manually"
         else:
-            label = (
-                f"✅ Liquid (spread ₹{spread:.1f} = {spread_pct:.1f}% of premium)"
-            )
+            # We have real bid/ask data — evaluate normally
+            liquid = spread_pct <= SPREAD_WARN_PCT
+            if spread_pct > SPREAD_BLOCK_PCT:
+                label = (
+                    f"⛔ Very illiquid (spread ₹{spread:.1f} = {spread_pct:.1f}% of premium)"
+                    f" — consider skipping or adjusting strike"
+                )
+            elif spread_pct > SPREAD_WARN_PCT:
+                label = (
+                    f"⚠️ Thin liquidity (spread ₹{spread:.1f} = {spread_pct:.1f}% of premium)"
+                    f" — use limit order, not market"
+                )
+            else:
+                label = (
+                    f"✅ Liquid (spread ₹{spread:.1f} = {spread_pct:.1f}% of premium)"
+                )
 
         logger.info(
             "[position_guard] Liquidity %s: LTP=%.1f bid=%.1f ask=%.1f "

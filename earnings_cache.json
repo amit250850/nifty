@@ -1,0 +1,173 @@
+{
+  "refreshed_at": "2026-04-07T09:12:55.453630",
+  "events": [
+    {
+      "symbol": "TCS",
+      "date": "2026-04-09",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "WIPRO",
+      "date": "2026-04-15",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "BAJAJ-AUTO",
+      "date": "2026-04-16",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "HDFCLIFE",
+      "date": "2026-04-16",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "INFY",
+      "date": "2026-04-16",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "HDFCBANK",
+      "date": "2026-04-18",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "ICICIBANK",
+      "date": "2026-04-18",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "HCLTECH",
+      "date": "2026-04-21",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "NESTLEIND",
+      "date": "2026-04-21",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "TECHM",
+      "date": "2026-04-22",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "AXISBANK",
+      "date": "2026-04-23",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "HINDUNILVR",
+      "date": "2026-04-23",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "INDUSINDBK",
+      "date": "2026-04-23",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "MARUTI",
+      "date": "2026-04-23",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "SBILIFE",
+      "date": "2026-04-23",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "TATACONSUM",
+      "date": "2026-04-23",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "RELIANCE",
+      "date": "2026-04-24",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "SHRIRAMFIN",
+      "date": "2026-04-24",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "KOTAKBANK",
+      "date": "2026-04-25",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "ULTRACEMCO",
+      "date": "2026-04-27",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "BAJAJFINSV",
+      "date": "2026-04-29",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "BAJFINANCE",
+      "date": "2026-04-29",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "BPCL",
+      "date": "2026-04-29",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "TRENT",
+      "date": "2026-04-29",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "ADANIENT",
+      "date": "2026-04-30",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "SBIN",
+      "date": "2026-04-30",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "COALINDIA",
+      "date": "2026-05-07",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    },
+    {
+      "symbol": "LT",
+      "date": "2026-05-07",
+      "purpose": "quarterly results (yfinance)",
+      "source": "yfinance"
+    }
+  ]
+}

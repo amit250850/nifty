@@ -588,7 +588,28 @@ def select_strike(kite, symbol: str, spot: float, direction: str,
     strike_used = atm + step * otm_direction   # default 1-strike OTM
 
     # ── 3a. NSE option chain (free, NFO only) ────────────────────────────
+    # IMPORTANT: only use the OC LTP map when its expiry matches the selected
+    # expiry.  The chain is always built for the NEAREST expiry, but the
+    # strike selector may roll to a further date (e.g. Monday with DTE=2
+    # rolls to next week).  A 50500 PE with 2 days left is ₹63; the same
+    # strike with 29 days left is ₹350+.  Using the wrong LTP silently
+    # understates premium, lot cost, SL, and target.
+    oc_expiry_matches = False
     if oc_data is not None and not is_mcx:
+        oc_expiry = oc_data.get("ltp_map_expiry")   # date or None
+        if oc_expiry is None:
+            # Older code path (NSE HTTP fallback) — no expiry tag, skip to be safe
+            oc_expiry_matches = False
+        elif isinstance(oc_expiry, date) and oc_expiry == expiry:
+            oc_expiry_matches = True
+        else:
+            logger.info(
+                "[strike_selector] OC LTP map is for %s but selected expiry is %s "
+                "— skipping OC lookup, using Kite LTP instead.",
+                oc_expiry, expiry,
+            )
+
+    if oc_expiry_matches:
         otm = atm + step * otm_direction
         premium = fetch_ltp_from_oc(oc_data, otm, option_type, symbol)
         if premium and premium > 0:

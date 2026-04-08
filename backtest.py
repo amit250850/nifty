@@ -77,6 +77,16 @@ YF_TICKERS = {
     "BANKNIFTY": "^NSEBANK",
 }
 
+# ETF tickers for VWAP computation — these have REAL volume unlike index tickers
+# ^NSEI / ^NSEBANK return zero volume → VWAP = NaN throughout.
+# NIFTYBEES.NS / BANKBEES.NS are actual traded securities (tracking error < 0.2%).
+# If the ETF is above its session VWAP, the index is above volume-weighted average.
+# The directional signal is identical. Used only with --vwap flag.
+ETF_TICKERS = {
+    "NIFTY":     "NIFTYBEES.NS",   # Nippon NIFTY 50 ETF  — price ≈ NIFTY/10
+    "BANKNIFTY": "BANKBEES.NS",    # Nippon Bank Nifty ETF — price ≈ BANKNIFTY/100
+}
+
 ATM_STEP = {
     "NIFTY":     50,
     "BANKNIFTY": 100,
@@ -276,6 +286,73 @@ def fetch_data(symbol: str) -> Optional[pd.DataFrame]:
     return df
 
 
+# ── ETF VWAP fetch ────────────────────────────────────────────────────────────
+
+def fetch_etf_vwap(symbol: str) -> Optional[pd.Series]:
+    """
+    Download the ETF proxy for NIFTY/BANKNIFTY and compute session-anchored VWAP.
+
+    Why ETF and not the index directly:
+      yfinance returns zero volume for ^NSEI / ^NSEBANK (they are index tickers,
+      not traded instruments). VWAP requires real trade volume to be meaningful.
+      NIFTYBEES.NS / BANKBEES.NS are actual ETFs traded on NSE with real volume
+      and they track the underlying indices within ~0.1-0.2% tracking error.
+
+      The directional VWAP signal (price above/below VWAP) is identical whether
+      computed on the ETF or the index — we only care about direction, not value.
+
+    Returns:
+      pd.Series of bool (True = ETF price above session VWAP = bullish signal),
+      indexed by IST timestamp. Returns None on download failure.
+    """
+    etf_ticker = ETF_TICKERS.get(symbol)
+    if etf_ticker is None:
+        return None
+
+    print(f"  Downloading {symbol} ETF ({etf_ticker}) for VWAP — 1H, 60 days …")
+    try:
+        df = yf.download(tickers=etf_ticker, period="60d", interval="1h",
+                         progress=False, auto_adjust=True)
+    except Exception as exc:
+        print(f"  ⚠️  ETF download failed ({exc}) — falling back to EMA50")
+        return None
+
+    if df is None or df.empty:
+        print(f"  ⚠️  No data for {etf_ticker} — falling back to EMA50")
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [c.lower() for c in df.columns]
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert(IST)
+    else:
+        df.index = df.index.tz_convert(IST)
+
+    df.sort_index(inplace=True)
+    df.dropna(subset=["close"], inplace=True)
+
+    # Check volume is non-zero (sanity check)
+    vol_sum = df["volume"].sum() if "volume" in df.columns else 0
+    if vol_sum == 0:
+        print(f"  ⚠️  {etf_ticker} has zero volume — VWAP would be NaN. Falling back to EMA50")
+        return None
+
+    # Compute session-anchored VWAP on the ETF
+    df["vwap_etf"] = compute_vwap(df)
+
+    # Directional signal: True = ETF above its VWAP = bullish
+    vwap_bull = (df["close"] > df["vwap_etf"]).rename("vwap_bull_etf")
+    # Replace NaN VWAP rows with NaN (can't signal without VWAP)
+    vwap_bull = vwap_bull.where(df["vwap_etf"].notna())
+
+    print(f"  ✅  ETF VWAP ready: {len(df)} candles | {etf_ticker} | "
+          f"vol={vol_sum:,.0f} | "
+          f"now={'above' if bool(vwap_bull.dropna().iloc[-1]) else 'below'} VWAP")
+    return vwap_bull
+
+
 # ── India VIX fetch ───────────────────────────────────────────────────────────
 
 def fetch_india_vix(days: int = 400) -> Optional[pd.DataFrame]:
@@ -329,7 +406,8 @@ def scan_signals(df: pd.DataFrame, symbol: str,
                  vix_df: Optional[pd.DataFrame] = None,
                  vix_min: Optional[float] = VIX_MIN,
                  vix_max: Optional[float] = VIX_MAX,
-                 vix_rank_max: Optional[float] = VIX_RANK_MAX) -> pd.DataFrame:
+                 vix_rank_max: Optional[float] = VIX_RANK_MAX,
+                 vwap_series: Optional[pd.Series] = None) -> pd.DataFrame:
     """
     Replay indicator logic candle-by-candle (no look-ahead bias).
 
@@ -338,11 +416,14 @@ def scan_signals(df: pd.DataFrame, symbol: str,
     vix_min      — skip signal if VIX < vix_min (market too calm, options won't move)
     vix_max      — skip signal if VIX > vix_max (IV crush risk if panic subsides)
     vix_rank_max — skip signal if VIX 252d rank > vix_rank_max (VIX already spiked)
+    vwap_series  — boolean Series from fetch_etf_vwap() (True = price above ETF VWAP).
+                   When provided, VWAP replaces EMA50 as the 4th indicator — matching
+                   the live bot's intended design. When None, falls back to EMA50.
 
     Returns a DataFrame of signals with columns:
       signal_time, direction, conviction, spot,
-      ema_bull, rsi, ema50_bull, st_bull, signals_agreed,
-      vix, vix_rank
+      ema_bull, rsi, fourth_bull (EMA50 or VWAP), st_bull, signals_agreed,
+      fourth_indicator, vix, vix_rank
     """
     df = df.copy()
 
@@ -361,14 +442,23 @@ def scan_signals(df: pd.DataFrame, symbol: str,
         df["vix_rank"] = np.nan
         df["vix_pct_1d"] = np.nan
 
+    # ── Merge ETF VWAP signal onto 1H price frame ──────────────────────────
+    if vwap_series is not None:
+        df = df.join(vwap_series.rename("vwap_bull_etf"), how="left")
+        # Forward-fill within each trading day only (don't carry yesterday's VWAP signal)
+        df["vwap_bull_etf"] = df["vwap_bull_etf"].ffill()
+    else:
+        df["vwap_bull_etf"] = np.nan
+
     # Compute all indicators on full history (EWM is causal — no look-ahead)
     df["ema9"]        = compute_ema(df["close"], EMA_FAST)
     df["ema21"]       = compute_ema(df["close"], EMA_SLOW)
     df["ema50"]       = compute_ema(df["close"], 50)
     df["rsi"]         = compute_rsi(df["close"], RSI_PERIOD)
     df["supertrend"]  = compute_supertrend(df)
-    df["vwap"]        = compute_vwap(df)   # kept for reference; NaN for index tickers
     df["hist_vol"]    = rolling_vol(df["close"])
+    # Note: compute_vwap() on ^NSEI/^NSEBANK always returns NaN (zero volume).
+    # Use fetch_etf_vwap() + --vwap flag to get real VWAP from ETF proxy instead.
 
     signals = []
 
@@ -394,7 +484,6 @@ def scan_signals(df: pd.DataFrame, symbol: str,
         ema9   = row["ema9"]
         ema21  = row["ema21"]
         rsi    = row["rsi"]
-        vwap   = row["vwap"]
         ema50  = row["ema50"]
         st     = row["supertrend"]
         close  = row["close"]
@@ -403,29 +492,33 @@ def scan_signals(df: pd.DataFrame, symbol: str,
             continue
 
         # ── India VIX filter (real IV proxy) ───────────────────────────────
-        # Only applied when VIX data is available AND filter is not None.
         row_vix      = row.get("vix",      float("nan"))
         row_vix_rank = row.get("vix_rank", float("nan"))
         if vix_df is not None:
             if vix_min is not None and not pd.isna(row_vix) and row_vix < vix_min:
-                continue   # market too calm — options won't reach 1.5× target
+                continue
             if vix_max is not None and not pd.isna(row_vix) and row_vix > vix_max:
-                continue   # VIX already elevated — IV crush risk if panic subsides
+                continue
             if vix_rank_max is not None and not pd.isna(row_vix_rank) and row_vix_rank > vix_rank_max:
-                continue   # VIX is at multi-month high — buying expensive options here
+                continue
 
-        ema_bull  = bool(ema9  > ema21)
-        rsi_bull  = bool(rsi   > 50)
-        st_bull   = bool(st    == 1)
+        ema_bull = bool(ema9 > ema21)
+        rsi_bull = bool(rsi  > 50)
+        st_bull  = bool(st   == 1)
 
-        # ── 4th indicator: EMA50 trend (replaces broken VWAP for index tickers)
-        # yfinance ^NSEI / ^NSEBANK have zero volume → VWAP = NaN throughout.
-        # EMA50 is a causal, volume-independent trend filter that works reliably
-        # and is consistent with the MCX signal model already in the live bot.
-        # NOTE: the live bot still uses VWAP — this is flagged as a live-bot fix below.
-        ema50_bull = bool(close > ema50)
+        # ── 4th indicator: VWAP (via ETF proxy) OR EMA50 fallback ─────────
+        # VWAP mode  (--vwap flag): uses ETF session VWAP — matches live bot design.
+        #   True = NIFTYBEES/BANKBEES price above its session VWAP = bullish.
+        # EMA50 mode (default):     uses price vs EMA50 — works without volume data.
+        vwap_raw = row.get("vwap_bull_etf", float("nan"))
+        if vwap_series is not None and not pd.isna(vwap_raw):
+            fourth_bull      = bool(vwap_raw)
+            fourth_indicator = "VWAP"
+        else:
+            fourth_bull      = bool(close > ema50)
+            fourth_indicator = "EMA50"
 
-        bull = sum([ema_bull, rsi_bull, ema50_bull, st_bull])
+        bull = sum([ema_bull, rsi_bull, fourth_bull, st_bull])
         bear = 4 - bull
 
         if   bull == 4: direction, conviction, agreed = "BUY CALL", "HIGH",   4
@@ -439,18 +532,19 @@ def scan_signals(df: pd.DataFrame, symbol: str,
             continue
 
         signals.append({
-            "signal_time":  ts,
-            "direction":    direction,
-            "conviction":   conviction,
-            "spot":         round(close, 2),
-            "ema_bull":     ema_bull,
-            "rsi":          round(rsi, 1),
-            "ema50_bull":   ema50_bull,
-            "st_bull":      st_bull,
-            "signals_agreed": agreed,
-            "hist_vol":     row["hist_vol"] if not pd.isna(row["hist_vol"]) else 0.20,
-            "vix":          round(row_vix, 2)      if not pd.isna(row_vix)      else None,
-            "vix_rank":     round(row_vix_rank, 1) if not pd.isna(row_vix_rank) else None,
+            "signal_time":      ts,
+            "direction":        direction,
+            "conviction":       conviction,
+            "spot":             round(close, 2),
+            "ema_bull":         ema_bull,
+            "rsi":              round(rsi, 1),
+            "fourth_bull":      fourth_bull,
+            "fourth_indicator": fourth_indicator,
+            "st_bull":          st_bull,
+            "signals_agreed":   agreed,
+            "hist_vol":         row["hist_vol"] if not pd.isna(row["hist_vol"]) else 0.20,
+            "vix":              round(row_vix, 2)      if not pd.isna(row_vix)      else None,
+            "vix_rank":         round(row_vix_rank, 1) if not pd.isna(row_vix_rank) else None,
         })
 
     return pd.DataFrame(signals)
@@ -721,6 +815,9 @@ def main():
                         help="Also show MEDIUM conviction trades (default: on)")
     parser.add_argument("--no-filter-hours", action="store_true",
                         help="Disable 10:00–15:00 alert window filter")
+    parser.add_argument("--vwap",  action="store_true",
+                        help="Use real VWAP (via ETF proxy) as 4th indicator instead of EMA50. "
+                             "Downloads NIFTYBEES.NS / BANKBEES.NS for volume data.")
     parser.add_argument("--no-vix",  action="store_true",
                         help="Disable India VIX filter entirely (for comparison)")
     parser.add_argument("--vix-min",  type=float, default=VIX_MIN,
@@ -738,6 +835,7 @@ def main():
                else [args.symbol])
     filter_hours = not args.no_filter_hours
     use_vix      = not args.no_vix
+    use_vwap     = args.vwap
     vix_min      = args.vix_min  if args.vix_min  > 0   else None
     vix_max      = args.vix_max  if args.vix_max  < 999 else None
     vix_rank_max = args.vix_rank_max if args.vix_rank_max < 100 else None
@@ -747,12 +845,17 @@ def main():
     if use_vix:
         vix_df = fetch_india_vix(days=400)   # 400d so 252d rank is populated
 
+    # ── Banner ────────────────────────────────────────────────────────────
+    fourth_ind_name = "VWAP via ETF proxy" if use_vwap else "EMA50"
     print("\n" + "═" * 64)
     print("  NiftySignalBot — Signal Backtest (last ~60 days)")
-    print("  Indicators: EMA9/21 × RSI(14) × EMA50 × SuperTrend(10,3)")
-    print("  ⚠️  4th indicator changed VWAP→EMA50 for backtest:")
-    print("     yfinance index tickers (^NSEI/^NSEBANK) return zero volume,")
-    print("     making VWAP = NaN. EMA50 is the reliable equivalent.")
+    if use_vwap:
+        print("  Indicators: EMA9/21 × RSI(14) × VWAP(ETF) × SuperTrend(10,3)")
+        print("  4th indicator: VWAP — computed on NIFTYBEES.NS / BANKBEES.NS ETFs")
+        print("    (^NSEI/^NSEBANK have zero volume; ETF proxy has real volume)")
+    else:
+        print("  Indicators: EMA9/21 × RSI(14) × EMA50 × SuperTrend(10,3)")
+        print("  4th indicator: EMA50 — use --vwap to switch to real VWAP via ETF")
     print(f"  Alert window: {'10:00–15:00 IST' if filter_hours else 'ALL HOURS'}")
     print(f"  SL: {int(SL_PCT*100)}% loss  |  Target: {TARGET_MULT}×  |  Hold until SL/Target/Expiry")
     print(f"  Min DTE: {MIN_DTE} day(s)  |  SL cooldown: {SL_COOLDOWN_HOURS}h after stop-out")
@@ -771,13 +874,21 @@ def main():
         if df is None:
             continue
 
+        # ── Fetch ETF VWAP for this symbol (only if --vwap flag set) ──────
+        vwap_series = None
+        if use_vwap:
+            vwap_series = fetch_etf_vwap(symbol)
+            if vwap_series is None:
+                print(f"  ⚠️  VWAP unavailable for {symbol} — using EMA50 as fallback")
+
         # HIGH conviction trades
         sigs_high = scan_signals(df, symbol, min_conviction="HIGH",
                                  filter_hours=filter_hours,
                                  vix_df=vix_df,
                                  vix_min=vix_min,
                                  vix_max=vix_max,
-                                 vix_rank_max=vix_rank_max)
+                                 vix_rank_max=vix_rank_max,
+                                 vwap_series=vwap_series)
         print(f"  Raw HIGH signals before position guard: {len(sigs_high)}")
 
         trades_high = simulate_trades(sigs_high, df, symbol)
@@ -790,7 +901,8 @@ def main():
                                     vix_df=vix_df,
                                     vix_min=vix_min,
                                     vix_max=vix_max,
-                                    vix_rank_max=vix_rank_max)
+                                    vix_rank_max=vix_rank_max,
+                                    vwap_series=vwap_series)
             sigs_med = sigs_all[sigs_all["conviction"] == "MEDIUM"]
             print(f"\n  Raw MEDIUM signals before position guard: {len(sigs_med)}")
             trades_med = simulate_trades(sigs_med, df, symbol)

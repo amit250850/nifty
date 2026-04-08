@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ── Feature flag ───────────────────────────────────────────────────────────────
 # Set True only when you are ready for live auto-execution.
 # While False: alerts fire, GTT note is included, but NO orders are placed.
-ENABLE_AUTO_EXECUTE: bool = False
+ENABLE_AUTO_EXECUTE: bool = True
 
 # Supported exchanges for auto-execution
 AUTO_EXEC_EXCHANGES = {"NFO"}

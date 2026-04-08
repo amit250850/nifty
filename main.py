@@ -29,6 +29,7 @@ Usage:
     python main.py      ← starts the bot
 """
 
+import dataclasses
 import logging
 import os
 import sys
@@ -44,7 +45,14 @@ from kiteconnect.exceptions import KiteException
 
 from modules.option_chain    import scan_option_chain
 from modules.chart_signals   import compute_signals
-from modules.strike_selector import select_strike
+from modules.strike_selector import (
+    select_strike,
+    fetch_ltp_from_oc,
+    fetch_ltp_from_kite as _fetch_ltp_kite,
+    build_nfo_symbol,
+    SL_PCT_DEFAULT,
+    TARGET_MULT,
+)
 from modules.telegram_alert  import send_full_alert, send_error_alert
 from modules.trade_logger    import log_signal, initialise_log
 from modules.position_guard  import has_open_position, check_margin, check_liquidity
@@ -439,7 +447,65 @@ def scan_and_signal() -> None:
             except Exception as exc:
                 logger.debug("[%s] Liquidity check error (non-fatal): %s", symbol, exc)
 
-        liquid = liquidity_info.get("liquid", True) if liquidity_info else True
+        # If liquidity_info is None (tradingsymbol lookup failed), treat as illiquid.
+        # Unknown depth = do not auto-execute. Human can still trade the alert manually.
+        liquid = liquidity_info.get("liquid", False) if liquidity_info else False
+
+        # ── Step 7b: ATM liquidity fallback (NFO only) ─────────────────────
+        # If the 1-OTM strike is illiquid (no depth data or wide spread),
+        # try the ATM strike instead before giving up on auto-execute.
+        #
+        # ATM always has tighter spreads and higher volume — far-OTM strikes
+        # (e.g. BANKNIFTY 50700 PE with ₹101 premium) often show "depth
+        # unavailable" while the ATM (50900 PE) is fully tradeable.
+        #
+        # We only swap the execution strike — the Telegram alert still shows
+        # the original OTM signal so you see exactly what the strategy fired.
+        atm_fallback_used = False
+        if (not liquid
+                and symbol not in MCX_SYMBOLS                          # NFO only
+                and strike.otm_strike != strike.atm_strike):           # not already ATM
+            try:
+                atm_ts = find_option_tradingsymbol(
+                    kite         = kite,
+                    symbol       = symbol,
+                    expiry_raw   = strike.expiry_raw,
+                    strike_price = float(strike.atm_strike),
+                    option_type  = strike.option_type,
+                    exchange     = exchange,
+                )
+                if atm_ts:
+                    atm_liq = check_liquidity(kite, atm_ts, exchange)
+                    if atm_liq.get("liquid", False):
+                        # ATM is liquid — fetch its premium and rebuild StrikeInfo
+                        atm_prem = fetch_ltp_from_oc(
+                            oc_data, strike.atm_strike, strike.option_type, symbol
+                        )
+                        if not atm_prem:
+                            atm_prem = _fetch_ltp_kite(kite, atm_ts, exchange)
+                        if atm_prem and atm_prem > 0:
+                            tgt_mult = TARGET_MULT.get(signal.conviction, 1.5)
+                            strike = dataclasses.replace(
+                                strike,
+                                otm_strike = strike.atm_strike,
+                                nfo_symbol = atm_ts,
+                                premium    = round(atm_prem, 2),
+                                lot_cost   = round(atm_prem * strike.lot_size, 2),
+                                stop_loss  = round(atm_prem * (1 - SL_PCT_DEFAULT), 2),
+                                target     = round(atm_prem * tgt_mult, 2),
+                            )
+                            tradingsymbol    = atm_ts
+                            liquidity_info   = atm_liq
+                            liquid           = True
+                            atm_fallback_used = True
+                            logger.info(
+                                "[%s] 🔄 ATM fallback: OTM illiquid → using ATM %d%s "
+                                "(₹%.2f, %s). Telegram alert still shows OTM signal.",
+                                symbol, strike.atm_strike, strike.option_type,
+                                atm_prem, atm_liq.get("label", ""),
+                            )
+            except Exception as exc:
+                logger.debug("[%s] ATM fallback error (non-fatal): %s", symbol, exc)
 
         # ── Step 8: Evaluate auto-execute guards ───────────────────────────
         # PCR ideal check (reuse telegram_alert logic for consistency)
@@ -461,13 +527,14 @@ def scan_and_signal() -> None:
         if is_alert_window_for(symbol):
             # Build the extra_info dict for the alert formatter
             extra_info = {
-                "available_margin": available_margin,
-                "liquidity":        liquidity_info,
-                "oi_trend":         oi_trend,
-                "auto_ok":          auto_ok,
-                "auto_reason":      auto_reason,
-                "tradingsymbol":    tradingsymbol,
-                "auto_exec_armed":  ENABLE_AUTO_EXECUTE,
+                "available_margin":   available_margin,
+                "liquidity":          liquidity_info,
+                "oi_trend":           oi_trend,
+                "auto_ok":            auto_ok,
+                "auto_reason":        auto_reason,
+                "tradingsymbol":      tradingsymbol,
+                "auto_exec_armed":    ENABLE_AUTO_EXECUTE and symbol == "NIFTY",
+                "atm_fallback_used":  atm_fallback_used,
             }
             try:
                 sent = send_full_alert(signal, strike, oc_data, extra_info=extra_info)
@@ -477,7 +544,7 @@ def scan_and_signal() -> None:
                 logger.error("[%s] Telegram error: %s", symbol, exc)
 
             # ── Step 10: Auto-execute (all 4 guards must pass) ────────────
-            if auto_ok and tradingsymbol and ENABLE_AUTO_EXECUTE:
+            if auto_ok and tradingsymbol and ENABLE_AUTO_EXECUTE and symbol == "NIFTY":
                 try:
                     trade_result = execute_trade(
                         kite          = kite,
@@ -578,7 +645,7 @@ def build_scheduler() -> BlockingScheduler:
 def print_banner() -> None:
     print("\n" + "=" * 60)
     print("  🟢  NiftySignalBot — OPTIONS SIGNAL SYSTEM")
-    exec_mode = "⚡ AUTO-EXECUTE + MONITOR" if ENABLE_AUTO_EXECUTE else "🔒 SIGNAL-ONLY (alert mode)"
+    exec_mode = "⚡ AUTO-EXECUTE (NIFTY) + MONITOR" if ENABLE_AUTO_EXECUTE else "🔒 SIGNAL-ONLY (alert mode)"
     print(f"  Mode: {exec_mode}")
     print("=" * 60)
     print(f"  Symbols   : {', '.join(SYMBOLS)}")
@@ -620,7 +687,7 @@ def main() -> None:
 
     if ENABLE_AUTO_EXECUTE:
         logger.warning(
-            "⚡ AUTO-EXECUTE is ENABLED — BUY orders will be placed when all guards pass!"
+            "⚡ AUTO-EXECUTE is ENABLED — NIFTY BUY orders will be placed when all guards pass!"
         )
     else:
         logger.info("🔒 Auto-execute is DISABLED — alert-only mode.")

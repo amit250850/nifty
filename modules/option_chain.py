@@ -430,17 +430,19 @@ def _scan_nse_via_kite(symbol: str, kite) -> Optional[dict]:
         "symbol":             symbol,
         "underlying":         round(spot, 2),
         "expiry":             expiry_str,
+        "ltp_map_expiry":     expiry,          # date object — strike_selector uses this
+                                               # to verify LTP map matches selected expiry
         "pcr":                pcr,
         "pcr_trend":          pcr_trend_label(pcr),
-        "call_oi":            total_call_oi,   # total call OI (for OI trend tracker)
-        "put_oi":             total_put_oi,    # total put  OI (for OI trend tracker)
+        "call_oi":            total_call_oi,
+        "put_oi":             total_put_oi,
         "max_call_oi_strike": max_oi["max_call_oi_strike"],
         "max_put_oi_strike":  max_oi["max_put_oi_strike"],
         "call_oi_changes":    oi_changes["call_oi_changes"],
         "put_oi_changes":     oi_changes["put_oi_changes"],
         "max_pain":           max_pain,
         "atm_iv":             0.0,
-        "iv_rank":            None,           # not available from Kite quotes
+        "iv_rank":            None,
         "strike_ltp_map":     ltp_map,
         "data_source":        "kite",
     }
