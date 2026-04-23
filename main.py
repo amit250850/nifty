@@ -1,7 +1,7 @@
 """
 main.py — NiftySignalBot Entry Point
 
-Signal-only options alert system for NIFTY, BANKNIFTY, SILVERM, GOLDM.
+Signal-only options alert system for NIFTY and BANKNIFTY.
 Signals are sent to Telegram for manual trading.
 
 AUTO-EXECUTE MODE (optional — controlled by gtt_manager.ENABLE_AUTO_EXECUTE):
@@ -14,12 +14,11 @@ AUTO-EXECUTE MODE (optional — controlled by gtt_manager.ENABLE_AUTO_EXECUTE):
   If any guard fails → manual alert only, no order.
 
 Architecture:
-  • APScheduler runs scan_and_signal() every 5 minutes, 9:00 AM – 11:30 PM IST.
+  • APScheduler runs scan_and_signal() every 5 minutes, 9:15 AM – 3:30 PM IST.
   • Each cycle:
-      1. Scan option chain via Kite Connect NFO API (NIFTY/BANKNIFTY) or
-         MCX spot-only (SILVERM/GOLDM).
-      2. Record OI snapshot in SQLite (NIFTY/BANKNIFTY only).
-      3. Compute chart signals (EMA/RSI/VWAP/SuperTrend) via Kite + yfinance.
+      1. Scan option chain via Kite Connect NFO API (NIFTY/BANKNIFTY).
+      2. Record OI snapshot in SQLite.
+      3. Compute chart signals (EMA/RSI/SuperTrend/EMA50) via Kite + yfinance.
       4. If conviction ≥ MEDIUM: select strike, run all guards, send alert.
       5. If all 4 guards pass: auto-execute BUY + OCO GTT (when enabled).
       6. Log to CSV.
@@ -60,8 +59,12 @@ from modules.gtt_manager     import (
     find_option_tradingsymbol, all_guards_pass, execute_trade,
     ENABLE_AUTO_EXECUTE,
 )
-from modules.oi_tracker      import initialise_db as init_oi_db, record_snapshot, get_oi_trend
-from modules.trade_monitor   import monitor_active_trades, monitor_unregistered_positions, send_eod_summary
+from modules.oi_tracker        import initialise_db as init_oi_db, record_snapshot, get_oi_trend
+from modules.trade_monitor     import monitor_active_trades, monitor_unregistered_positions, send_eod_summary
+from modules.earnings_calendar import (
+    get_results_today, get_results_yesterday, get_results_this_week,
+    refresh_cache as refresh_earnings, is_result_season, add_manual_date,
+)
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -82,26 +85,89 @@ load_dotenv()
 API_KEY      = os.getenv("KITE_API_KEY")
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
 
-SYMBOLS                = ["NIFTY", "BANKNIFTY", "SILVERM", "GOLDM"]
+SYMBOLS                = []   # NSE options scanner DISABLED — 12-month backtest: -₹1.05L (NIFTY 31.4% win, BANKNIFTY 37.9% win)
 SCAN_INTERVAL_MINUTES  = 5
 
-# ── Per-symbol minimum conviction for sending alerts ───────────────────────────
-# Derived from 60-day backtest (DTE≥3, SL cooldown, --no-vix):
+# ── NIFTY/BANKNIFTY directional options — SUPPRESSED (loss-making) ─────────────
+# 12-month backtest (May 2025 – Apr 2026):
+#   NIFTY  HIGH: 51 trades, 31.4% win, -₹59,552 (5 green / 7 red months)
+#   BNKFTY HIGH: 58 trades, 37.9% win, -₹45,253 (3 green / 8 red months)
 #
-#   NIFTY HIGH   : 18 trades, 61.1% win, +₹26,682  ← trade
-#   NIFTY MEDIUM :  9 trades, 66.7% win, +₹15,712  ← trade (MEDIUM actually better!)
-#   BANKNIFTY HIGH : 16 trades, 43.8% win, +₹17,002  ← trade (R:R saves it in trends)
-#   BANKNIFTY MEDIUM: 11 trades, 45.5% win, +₹968  ← SKIP (₹88/trade avg, not worth it)
+# Root cause: 2025 was choppy/range-bound — directional options buying requires
+# trending markets to overcome theta decay. Edge only exists in strong trending
+# regimes (Oct 2025 – Mar 2026 showed positive months).
 #
-# BANKNIFTY MEDIUM is barely breakeven (+₹968 over 60 days) and generates
-# consecutive SL streaks in choppy markets. HIGH only for BANKNIFTY.
-# NIFTY signals are consistently reliable at both conviction levels.
+# Re-enable condition: switch SYMBOLS back to ["NIFTY"] when India VIX > 18
+# AND market is in a confirmed directional trend (e.g. 3+ consecutive trend days).
+# Profitable substitute: MCX CPR commodities (all 4 green — see below).
 SYMBOL_MIN_CONVICTION: dict[str, str] = {
-    "NIFTY":     "MEDIUM",   # Both HIGH and MEDIUM are profitable
-    "BANKNIFTY": "HIGH",     # MEDIUM gives only +₹968/60 days — skip
-    "SILVERM":   "MEDIUM",   # No backtest data yet — default to MEDIUM
-    "GOLDM":     "MEDIUM",   # No backtest data yet — default to MEDIUM
+    "NIFTY": "HIGH",   # HIGH only if/when re-enabled
 }
+
+# ── Straddle stats (backtest-derived, 2Y gap≥3%, 2H exit) ─────────────────────
+# Source: backtest_event_straddle.py — buy ATM CE+PE at prev close, exit winner
+# at 2H after gap open, sell loser at open (15% salvage).
+#
+# IMPORTANT — what this backtest measures vs what it DOESN'T:
+#   ✅ Detects all ≥3% gap days as proxy for earnings/event days (2Y history)
+#   ✅ Models IV inflation (1.4× realized vol pre-event) + IV crush post-event
+#   ⚠️  Real pre-event IV can be 2–3× realized vol → actual cost higher → real
+#       profits ~20–40% lower than shown. Edge still exists for T1 stocks.
+#   ❌ MACRO EVENTS (FOMC/RBI/Budget) tested separately → 0–25% win, -₹130K
+#      These are NOT traded by this bot. Only individual stock earnings are fired.
+#
+# Tier guide: T1 = strong consistent edge (≥10 events, ≥92% win, high avg P&L)
+#             T2 = good edge but smaller avg P&L or fewer events
+#             AVOID = backtest shows net loss
+STRADDLE_STATS: dict[str, dict] = {
+    # ── TIER 1 — strong, consistent ──────────────────────────────────────────
+    "TRENT":      {"tier": 1, "win_2h": 100, "avg_pnl_2h": 122266, "outlay": 51500},
+    "INDIGO":     {"tier": 1, "win_2h": 100, "avg_pnl_2h":  60722, "outlay": 24000},
+    "BEL":        {"tier": 1, "win_2h": 100, "avg_pnl_2h":  69600, "outlay": 28400},
+    "M&M":        {"tier": 1, "win_2h": 100, "avg_pnl_2h":  97609, "outlay": 39900},
+    "SBIN":       {"tier": 1, "win_2h": 100, "avg_pnl_2h":  71099, "outlay": 27000},
+    "AXISBANK":   {"tier": 1, "win_2h": 100, "avg_pnl_2h":  66700, "outlay": 21000},
+    "MARUTI":     {"tier": 1, "win_2h": 100, "avg_pnl_2h":  51957, "outlay": 19800},
+    "LT":         {"tier": 1, "win_2h": 100, "avg_pnl_2h":  51525, "outlay": 16200},
+    "EICHERMOT":  {"tier": 1, "win_2h": 100, "avg_pnl_2h":  46891, "outlay": 17500},
+    "TATACONSUM": {"tier": 1, "win_2h": 100, "avg_pnl_2h":  54543, "outlay": 24200},
+    "CIPLA":      {"tier": 1, "win_2h": 100, "avg_pnl_2h":  46626, "outlay": 11000},
+    "ADANIENT":   {"tier": 1, "win_2h": 100, "avg_pnl_2h":  40501, "outlay": 17000},
+    "INDUSINDBK": {"tier": 1, "win_2h": 100, "avg_pnl_2h":  40651, "outlay": 18000},
+    "HEROMOTOCO": {"tier": 1, "win_2h": 100, "avg_pnl_2h":  54006, "outlay": 21500},
+    "TITAN":      {"tier": 1, "win_2h": 100, "avg_pnl_2h":  49372, "outlay": 18400},
+    "BHARTIARTL": {"tier": 1, "win_2h": 100, "avg_pnl_2h": 110471, "outlay": 41300},
+    # ── TIER 2 — good edge, smaller P&L or fewer events ──────────────────────
+    "NTPC":       {"tier": 2, "win_2h": 100, "avg_pnl_2h":  68551, "outlay": 42300},
+    "HINDALCO":   {"tier": 2, "win_2h":  93, "avg_pnl_2h":  38574, "outlay": 24600},
+    "SHRIRAMFIN": {"tier": 2, "win_2h": 100, "avg_pnl_2h":  21295, "outlay": 10900},
+    "TECHM":      {"tier": 2, "win_2h": 100, "avg_pnl_2h":  37677, "outlay": 16600},
+    "SBILIFE":    {"tier": 2, "win_2h": 100, "avg_pnl_2h":  47446, "outlay": 18400},
+    "SUNPHARMA":  {"tier": 2, "win_2h": 100, "avg_pnl_2h":  49192, "outlay": 18500},
+    "COALINDIA":  {"tier": 2, "win_2h": 100, "avg_pnl_2h":  46055, "outlay": 20200},
+    "TATASTEEL":  {"tier": 2, "win_2h": 100, "avg_pnl_2h":  30915, "outlay": 18700},
+    "JSWSTEEL":   {"tier": 2, "win_2h": 100, "avg_pnl_2h":  32108, "outlay": 12000},
+    "BAJAJ-AUTO": {"tier": 2, "win_2h": 100, "avg_pnl_2h":  28820, "outlay":  9800},
+    "HCLTECH":    {"tier": 2, "win_2h": 100, "avg_pnl_2h":  36266, "outlay": 16800},
+    "ASIANPAINT": {"tier": 2, "win_2h": 100, "avg_pnl_2h":  21535, "outlay":  9500},
+    "APOLLOHOSP": {"tier": 2, "win_2h": 100, "avg_pnl_2h":  38041, "outlay": 13500},
+    "ULTRACEMCO": {"tier": 2, "win_2h": 100, "avg_pnl_2h":  43160, "outlay": 17500},
+    "DIVISLAB":   {"tier": 2, "win_2h": 100, "avg_pnl_2h":  23807, "outlay":  9000},
+    "BPCL":       {"tier": 2, "win_2h": 100, "avg_pnl_2h":  22934, "outlay":  5200},
+    "BAJAJFINSV": {"tier": 2, "win_2h": 100, "avg_pnl_2h":  27329, "outlay": 13000},
+    "HINDUNILVR": {"tier": 2, "win_2h": 100, "avg_pnl_2h":  25064, "outlay": 10800},
+    "GRASIM":     {"tier": 2, "win_2h": 100, "avg_pnl_2h":  21978, "outlay":  8500},
+    "HDFCBANK":   {"tier": 2, "win_2h": 100, "avg_pnl_2h":  17541, "outlay":  8000},
+    "ICICIBANK":  {"tier": 2, "win_2h": 100, "avg_pnl_2h":  26724, "outlay": 12400},
+    "TCS":        {"tier": 2, "win_2h": 100, "avg_pnl_2h":  23154, "outlay":  7000},
+    "INFY":       {"tier": 2, "win_2h": 100, "avg_pnl_2h":  20587, "outlay":  6900},
+    "RELIANCE":   {"tier": 2, "win_2h": 100, "avg_pnl_2h":  14588, "outlay":  4700},
+    "HDFCLIFE":   {"tier": 2, "win_2h":  80, "avg_pnl_2h":  22416, "outlay":  8300},
+    "POWERGRID":  {"tier": 2, "win_2h":  83, "avg_pnl_2h":  31224, "outlay": 14700},
+    # ── AVOID — backtest net loss ─────────────────────────────────────────────
+    "ONGC":       {"tier": 0, "win_2h":  29, "avg_pnl_2h":  -5306, "outlay": 27300},
+}
+TIER_LABEL = {1: "🥇 T1", 2: "🥈 T2", 3: "🥉 T3", 0: "⛔ AVOID"}
 
 # ── NSE hours (equity index options) ──────────────────────────────────────────
 MARKET_OPEN_H,  MARKET_OPEN_M  = 9,  15
@@ -112,16 +178,6 @@ MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
 # Signals fired in this window have much lower reliability.
 ALERT_START_H, ALERT_START_M = 10, 0
 ALERT_END_H,   ALERT_END_M   = 15, 0
-
-# ── MCX hours (commodity options — SILVERM/GOLDM trade until 11:30 PM IST) ────
-MCX_OPEN_H,  MCX_OPEN_M  = 9,  0
-MCX_CLOSE_H, MCX_CLOSE_M = 23, 30
-# MCX symbols that run the extended session
-MCX_SYMBOLS = {"SILVERM", "GOLDM"}
-
-# ── GOLDM budget filter ────────────────────────────────────────────────────────
-# Skip GOLDM alerts if the option lot cost exceeds this threshold
-GOLDM_MAX_LOT_COST = 50_000
 
 # Global Kite client
 kite: KiteConnect = None
@@ -172,50 +228,40 @@ def initialise_kite() -> bool:
 
 def is_symbol_market_open(symbol: str) -> bool:
     """
-    Return True if the market for this specific symbol is currently open.
-
-    NSE symbols (NIFTY, BANKNIFTY): Mon–Fri 9:15 AM – 3:30 PM IST
-    MCX symbols (SILVERM):            Mon–Fri 9:00 AM – 11:30 PM IST
+    Return True if the NSE market is currently open.
+    Mon–Fri 9:15 AM – 3:30 PM IST.
     """
     now = datetime.now(IST)
     if now.weekday() >= 5:    # Saturday / Sunday
         return False
-    if symbol in MCX_SYMBOLS:
-        open_time  = now.replace(hour=MCX_OPEN_H,  minute=MCX_OPEN_M,  second=0, microsecond=0)
-        close_time = now.replace(hour=MCX_CLOSE_H, minute=MCX_CLOSE_M, second=0, microsecond=0)
-    else:
-        open_time  = now.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,  second=0, microsecond=0)
-        close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0)
+    open_time  = now.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,  second=0, microsecond=0)
+    close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0)
     return open_time <= now <= close_time
 
 
+def is_mcx_session_open() -> bool:
+    """MCX trades until 23:30 — keep scheduler alive until 22:00 for EOD reminder."""
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    return now.replace(hour=10, minute=0, second=0, microsecond=0) <= now <= now.replace(hour=22, minute=0, second=0, microsecond=0)
+
+
 def is_market_open() -> bool:
-    """Return True if ANY symbol's market is currently open (drives scheduler wake-up)."""
-    return any(is_symbol_market_open(s) for s in SYMBOLS)
+    """Return True if NSE or MCX session is open (drives scheduler wake-up)."""
+    return any(is_symbol_market_open(s) for s in SYMBOLS) or is_mcx_session_open()
 
 
 def is_alert_window_for(symbol: str) -> bool:
     """
-    Per-symbol Telegram alert window:
-
-    NSE (NIFTY, BANKNIFTY):
-      10:00 AM – 3:00 PM — skips the first 45 minutes of opening-noise
-      algo spikes and fake breakouts (9:15–10:00 AM).
-
-    MCX (SILVERM, GOLDM):
-      Full MCX session 9:00 AM – 11:30 PM — commodity moves happen
-      morning AND evening (US/London market open). The HIGH/MEDIUM
-      conviction threshold naturally prevents constant pinging.
+    NSE Telegram alert window: 10:00 AM – 3:00 PM.
+    Skips the first 45 minutes of opening-noise, algo spikes,
+    and fake breakouts (9:15–10:00 AM).
     """
     now = datetime.now(IST)
-    if symbol in MCX_SYMBOLS:
-        open_time  = now.replace(hour=MCX_OPEN_H,  minute=MCX_OPEN_M,  second=0, microsecond=0)
-        close_time = now.replace(hour=MCX_CLOSE_H, minute=MCX_CLOSE_M, second=0, microsecond=0)
-        return open_time <= now <= close_time
-    else:
-        alert_start = now.replace(hour=ALERT_START_H, minute=ALERT_START_M, second=0, microsecond=0)
-        alert_end   = now.replace(hour=ALERT_END_H,   minute=ALERT_END_M,   second=0, microsecond=0)
-        return alert_start <= now <= alert_end
+    alert_start = now.replace(hour=ALERT_START_H, minute=ALERT_START_M, second=0, microsecond=0)
+    alert_end   = now.replace(hour=ALERT_END_H,   minute=ALERT_END_M,   second=0, microsecond=0)
+    return alert_start <= now <= alert_end
 
 
 def _is_token_expiry_error(exc: Exception) -> bool:
@@ -223,6 +269,293 @@ def _is_token_expiry_error(exc: Exception) -> bool:
     return isinstance(exc, KiteException) and (
         "token" in str(exc).lower() or "TokenException" in type(exc).__name__
     )
+
+
+# ── Daily Briefing & Straddle Intelligence ─────────────────────────────────────
+
+def _send_telegram_raw(message: str) -> None:
+    """Send a plain Telegram message (reuses telegram_alert internals)."""
+    try:
+        from modules.telegram_alert import send_alert
+        send_alert(message)
+    except Exception as exc:
+        logger.warning("Telegram send failed: %s", exc)
+
+
+def _straddle_line(ev: dict) -> str:
+    """Format one event as a compact straddle radar line."""
+    from datetime import date as _date
+    sym   = ev["symbol"]
+    d     = _date.fromisoformat(ev["date"])
+    stats = STRADDLE_STATS.get(sym, {})
+    tier  = TIER_LABEL.get(stats.get("tier", 3), "")
+    win   = stats.get("win_2h", "?")
+    pnl   = stats.get("avg_pnl_2h", 0)
+    out   = stats.get("outlay", 0)
+    today = _date.today()
+    days  = (d - today).days
+    when  = "⚡ TOMORROW" if days == 1 else (f"📅 {d.strftime('%a %d %b')}" if days > 1 else "📌 TODAY")
+    return (f"  {when}: <b>{sym}</b> {tier}  "
+            f"win={win}%  avg=₹{pnl:,.0f}  outlay≈₹{out:,.0f}")
+
+
+def send_morning_briefing() -> None:
+    """
+    Daily 8:45 AM briefing sent to Telegram.
+    Covers: market regime (brief), straddle radar for the week,
+    and an urgent action line if results are tomorrow.
+    """
+    from datetime import date as _date
+    import pytz as _pytz
+
+    now_ist = datetime.now(IST)
+    today   = _date.today()
+    weekday = now_ist.strftime("%A")
+
+    # ── Regime summary (non-fatal if market_regime unavailable) ──────────────
+    regime_line = ""
+    try:
+        from market_regime import get_regime_signal
+        regime = get_regime_signal()
+        bias   = regime.get("bias", "NEUTRAL").upper()
+        conf   = regime.get("confidence", "low").title()
+        bias_emoji = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(bias, "⚪")
+        regime_line = f"\n🧭 <b>Market Regime:</b> {bias_emoji} {bias} ({conf} confidence)"
+    except Exception:
+        pass   # market_regime is optional — briefing continues without it
+
+    # ── Straddle radar ────────────────────────────────────────────────────────
+    week_events = get_results_this_week(days=7)
+    today_results = get_results_today()
+
+    radar_lines = []
+    for ev in week_events:
+        radar_lines.append(_straddle_line(ev))
+
+    if not radar_lines and is_result_season():
+        radar_lines = ["  📭 No confirmed dates yet — check NSE calendar"]
+
+    radar_block = "\n".join(radar_lines) if radar_lines else "  📭 No upcoming results in next 7 days"
+
+    # ── Action line — results TODAY after market = buy straddle before close ──
+    action_line = ""
+    if today_results:
+        names = ", ".join(e["symbol"] for e in today_results)
+        action_line = (
+            f"\n\n⚠️ <b>ACTION REQUIRED TODAY</b>\n"
+            f"<b>{names}</b> results TONIGHT after market!\n"
+            f"Buy straddle (CE + PE at ATM) before 3:20 PM.\n"
+            f"Full alert with strike/premium at 3:00 PM."
+        )
+
+    msg = (
+        f"🌅 <b>NiftySignalBot — Morning Briefing</b>\n"
+        f"{today.strftime('%A, %d %b %Y')}"
+        f"{regime_line}\n\n"
+        f"📊 <b>Straddle Radar — Next 7 Days:</b>\n"
+        f"{radar_block}"
+        f"{action_line}\n\n"
+        f"🔒 Bot scanning 10:00 AM – 3:00 PM | Auto-exec: "
+        f"{'⚡ ON' if ENABLE_AUTO_EXECUTE else '🔒 OFF'}"
+    )
+    _send_telegram_raw(msg)
+    logger.info("Morning briefing sent.")
+
+
+def _last_thursday_of_month(d):
+    """Return the last Thursday of d's month (NSE monthly expiry day)."""
+    from datetime import date as _d, timedelta as _td
+    import calendar as _cal
+    last_day = _d(d.year, d.month, _cal.monthrange(d.year, d.month)[1])
+    # walk back from last_day until we hit Thursday (weekday=3)
+    offset = (last_day.weekday() - 3) % 7
+    return last_day - _td(days=offset)
+
+
+def _options_dte(result_date) -> int:
+    """
+    Calendar days from result_date to the monthly expiry Thursday.
+    If result_date is after that Thursday (shouldn't happen), rolls to next month.
+    """
+    from datetime import date as _d, timedelta as _td
+    expiry = _last_thursday_of_month(result_date)
+    if expiry < result_date:                        # result is after this month's expiry
+        nxt = _d(result_date.year + (result_date.month // 12),
+                  (result_date.month % 12) + 1, 1)
+        expiry = _last_thursday_of_month(nxt)
+    return (expiry - result_date).days
+
+
+def send_straddle_prealert() -> None:
+    """
+    3:00 PM daily job — send full straddle alert for any stock
+    with results TODAY after market, while market is still open to act.
+
+    Correct timing:
+      - Results announced tonight after 3:30 PM
+      - Buy straddle NOW before 3:20 PM close
+      - Gap happens TOMORROW morning
+      - Exit TOMORROW: sell loser at open, winner at 11:15 AM
+
+    DTE gate: only fire when monthly expiry is ≤5 calendar days away
+    from the results date (i.e. last week before expiry).  Mid-month
+    results have options priced with 10-15 days of extra time-value,
+    pushing the break-even above TCS/NIFTY50's typical 4-6% move —
+    the edge disappears. Alert suppressed with reason logged.
+    """
+    import math as _math
+    import numpy as _np
+    import yfinance as _yf
+    from datetime import date as _date
+
+    today_events = get_results_today()
+    if not today_events:
+        logger.info("[straddle] No results today — no pre-alert needed.")
+        return
+
+    for ev in today_events:
+        sym = ev["symbol"]
+        stats = STRADDLE_STATS.get(sym, {})
+        tier  = stats.get("tier", 3)
+        if tier == 0:
+            logger.info("[straddle] Skipping %s — tier 0 (avoid list).", sym)
+            continue
+
+        # ── DTE gate: monthly options behave like weeklies only in last 5 days ──
+        try:
+            result_date = _date.fromisoformat(ev["date"])
+            dte = _options_dte(result_date)
+            expiry_thu = _last_thursday_of_month(result_date)
+            if dte > 5:
+                logger.info(
+                    "[straddle] %s — results on %s but DTE=%d to expiry %s. "
+                    "Mid-month: monthly options have %.0f days extra time-value "
+                    "→ BE%% too high for typical move. Suppressing alert.",
+                    sym, ev["date"], dte, expiry_thu, dte - 1,
+                )
+                continue
+            logger.info(
+                "[straddle] %s — DTE=%d to expiry %s ✅ — options behave like weeklies.",
+                sym, dte, expiry_thu,
+            )
+        except Exception as _dte_err:
+            logger.warning("[straddle] DTE check failed for %s: %s — proceeding.", sym, _dte_err)
+
+        # Fetch live spot + vol
+        try:
+            from modules.earnings_calendar import NIFTY50_TICKERS as _tickers
+            ticker_str = _tickers.get(sym)
+            df = _yf.download(ticker_str, period="40d", interval="1d",
+                              auto_adjust=True, progress=False)
+            if df is None or df.empty:
+                raise ValueError("no data")
+            closes  = df["Close"].squeeze()
+            spot    = float(closes.iloc[-1])
+            log_ret = _np.log(closes / closes.shift(1)).dropna()
+            vol     = float(max(0.15, min(1.2, log_ret.tail(30).std() * _math.sqrt(252))))
+            pre_vol = vol * 1.40
+
+            # ATM strike
+            rnd  = {"MARUTI": 500, "EICHERMOT": 100, "BAJAJ-AUTO": 100}.get(sym, 50)
+            K    = round(spot / rnd) * rnd
+            T    = 1.0 / 365.0
+            r    = 0.065
+
+            def _ncdf(x):
+                return 0.5 * _math.erfc(-x / _math.sqrt(2))
+            def _bsc(S, K, T, r, s):
+                if T <= 0 or s <= 0: return max(0, S - K)
+                d1 = (_math.log(S/K) + (r + 0.5*s*s)*T) / (s*_math.sqrt(T))
+                d2 = d1 - s*_math.sqrt(T)
+                return S*_ncdf(d1) - K*_math.exp(-r*T)*_ncdf(d2)
+            def _bsp(S, K, T, r, s):
+                if T <= 0 or s <= 0: return max(0, K - S)
+                d1 = (_math.log(S/K) + (r + 0.5*s*s)*T) / (s*_math.sqrt(T))
+                d2 = d1 - s*_math.sqrt(T)
+                return K*_math.exp(-r*T)*_ncdf(-d2) - S*_ncdf(-d1)
+
+            call_c = _bsc(spot, K, T, r, pre_vol)
+            put_c  = _bsp(spot, K, T, r, pre_vol)
+            total  = call_c + put_c
+            be_pct = (total / K) * 100
+
+            from modules.earnings_calendar import NIFTY50_TICKERS as _tickers2
+            LOT = {
+                "RELIANCE": 250, "TCS": 150, "HDFCBANK": 550, "INFY": 300,
+                "ICICIBANK": 700, "SBIN": 1500, "AXISBANK": 1200, "LT": 300,
+                "ASIANPAINT": 200, "MARUTI": 100, "TITAN": 375, "WIPRO": 1500,
+                "BAJFINANCE": 125, "HCLTECH": 700, "JSWSTEEL": 675, "NTPC": 4500,
+                "ONGC": 1925, "INDUSINDBK": 600, "TECHM": 600, "SUNPHARMA": 700,
+                "ADANIENT": 250, "BAJAJFINSV": 500, "CIPLA": 650, "DRREDDY": 125,
+                "EICHERMOT": 200, "GRASIM": 250, "HEROMOTOCO": 300, "HINDALCO": 1400,
+                "M&M": 700, "TATASTEEL": 5500, "TATACONSUM": 1100, "APOLLOHOSP": 125,
+                "BPCL": 1800, "COALINDIA": 2800, "DIVISLAB": 100, "INDIGO": 300,
+                "SBILIFE": 750, "SHRIRAMFIN": 600, "TRENT": 500, "BAJAJ-AUTO": 75,
+                "HDFCLIFE": 1100, "BEL": 4900, "BHARTIARTL": 1851,
+            }
+            lot    = LOT.get(sym, 500)
+            outlay = total * lot
+            win_2h = stats.get("win_2h", 70)
+            avg_pnl= stats.get("avg_pnl_2h", 0)
+            tier_lbl = {1: "🥇 TIER 1", 2: "🥈 TIER 2", 3: "🥉 TIER 3"}.get(tier, "")
+
+            result_date_str = _date.fromisoformat(ev["date"]).strftime("%d %b %Y")
+
+            msg = (
+                f"🔔 <b>STRADDLE ALERT — BUY NOW</b>\n"
+                f"{'━' * 34}\n"
+                f"<b>{sym}</b>  {tier_lbl}\n"
+                f"Results: {result_date_str}  ⚡ TONIGHT after market\n"
+                f"{'━' * 34}\n\n"
+                f"📊 <b>Straddle Setup</b>\n"
+                f"  Spot: ₹{spot:,.2f}  |  Strike: {K}\n"
+                f"  Call: ₹{call_c:.2f}  +  Put: ₹{put_c:.2f}\n"
+                f"  <b>Total outlay: ₹{outlay:,.0f}</b>  (lot={lot})\n"
+                f"  Break-even: ±{be_pct:.1f}% move needed\n\n"
+                f"📈 <b>Historical Edge (2Y backtest)</b>\n"
+                f"  <b>Win rate at 2H exit: {win_2h}%</b>\n"
+                f"  Avg P&amp;L per trade: ₹{avg_pnl:,.0f}\n\n"
+                f"🎯 <b>Trade Plan</b>\n"
+                f"  <b>TODAY before 3:20 PM:</b>\n"
+                f"    Buy {K} CE  +  Buy {K} PE\n"
+                f"  <b>TOMORROW open:</b> Sell losing leg at market\n"
+                f"  <b>TOMORROW 11:15 AM:</b> Exit winning leg ← HARD EXIT\n\n"
+                f"{'━' * 34}\n"
+                f"⚠️ <b>BUY BEFORE CLOSE — {win_2h}% win rate | ₹{avg_pnl:,.0f} avg</b>"
+            )
+            _send_telegram_raw(msg)
+            logger.info("[straddle] Pre-alert sent for %s.", sym)
+
+        except Exception as exc:
+            logger.warning("[straddle] Pre-alert failed for %s: %s", sym, exc)
+
+
+def send_exit_reminder() -> None:
+    """
+    9:15 AM job — if yesterday was a results day for any tracked stock,
+    send an exit reminder: sell losing leg at open + exit winner at 11:15 AM.
+    Results are announced after market close, so the gap happens the NEXT morning.
+    """
+    from datetime import date as _date
+    yesterday_events = get_results_yesterday()
+    if not yesterday_events:
+        return
+    for ev in yesterday_events:
+        sym = ev["symbol"]
+        msg = (
+            f"⏰ <b>STRADDLE EXIT REMINDER — {sym}</b>\n"
+            f"{'━' * 34}\n"
+            f"Results day! Here's your checklist:\n\n"
+            f"  ✅ <b>RIGHT NOW at open:</b>\n"
+            f"     Sell the LOSING leg at MARKET\n\n"
+            f"  ⏰ <b>11:15 AM — HARD EXIT:</b>\n"
+            f"     Exit the winning leg regardless of price\n"
+            f"     (2H exit = 2× better than holding to EOD)\n\n"
+            f"  ❌ Do NOT hold to EOD — IV crush kills the premium\n"
+            f"{'━' * 34}"
+        )
+        _send_telegram_raw(msg)
+        logger.info("[straddle] Exit reminder sent for %s.", sym)
 
 
 # ── Main scan cycle ────────────────────────────────────────────────────────────
@@ -336,6 +669,19 @@ def scan_and_signal() -> None:
             )
             continue
 
+        # ── Step 2c: Weekday MEDIUM suppression ────────────────────────────
+        # On Tue/Wed/Thu weekly options have DTE<3 — MEDIUM signals have <50%
+        # win rate on these days. Suppress ALL MEDIUM alerts Tue/Wed/Thu for
+        # both NIFTY and BANKNIFTY. HIGH conviction signals still go through.
+        _weekday = datetime.now(IST).weekday()  # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
+        if _weekday in (1, 2, 3) and signal.conviction == "MEDIUM":
+            logger.info(
+                "[%s] ⏭  MEDIUM suppressed on Tue/Wed/Thu (DTE<3, sub-50%% win). "
+                "Waiting for Mon/Fri or HIGH conviction signal.",
+                symbol,
+            )
+            continue
+
         # ── Step 3: Duplicate position check ──────────────────────────────
         # If an open option position already exists for this symbol+direction,
         # skip the alert entirely — prevents doubling into a losing trade.
@@ -405,27 +751,19 @@ def scan_and_signal() -> None:
             )
             continue
 
-        # ── Step 4c: GOLDM hard budget cap ────────────────────────────────
-        if symbol == "GOLDM" and strike.lot_cost >= GOLDM_MAX_LOT_COST:
-            logger.info(
-                "[GOLDM] Lot cost ₹%.0f ≥ ₹%.0f cap — skipping.", strike.lot_cost, GOLDM_MAX_LOT_COST
-            )
-            continue
-
         # ── Step 5: Margin check ───────────────────────────────────────────
         margin_ok, available_margin = check_margin(kite, symbol, strike.lot_cost)
 
-        # ── Step 6: OI trend (NIFTY/BANKNIFTY only) ───────────────────────
+        # ── Step 6: OI trend ──────────────────────────────────────────────
         oi_trend = None
-        if symbol not in MCX_SYMBOLS:
-            try:
-                oi_trend = get_oi_trend(symbol)
-            except Exception as exc:
-                logger.debug("[%s] OI trend error (non-fatal): %s", symbol, exc)
+        try:
+            oi_trend = get_oi_trend(symbol)
+        except Exception as exc:
+            logger.debug("[%s] OI trend error (non-fatal): %s", symbol, exc)
 
         # ── Step 7: Tradingsymbol lookup + liquidity check ─────────────────
         # Required for both liquidity assessment and GTT placement.
-        exchange       = "MCX" if symbol in MCX_SYMBOLS else "NFO"
+        exchange       = "NFO"
         tradingsymbol  = None
         liquidity_info = None
 
@@ -451,7 +789,7 @@ def scan_and_signal() -> None:
         # Unknown depth = do not auto-execute. Human can still trade the alert manually.
         liquid = liquidity_info.get("liquid", False) if liquidity_info else False
 
-        # ── Step 7b: ATM liquidity fallback (NFO only) ─────────────────────
+        # ── Step 7b: ATM liquidity fallback ────────────────────────────────
         # If the 1-OTM strike is illiquid (no depth data or wide spread),
         # try the ATM strike instead before giving up on auto-execute.
         #
@@ -463,7 +801,6 @@ def scan_and_signal() -> None:
         # the original OTM signal so you see exactly what the strategy fired.
         atm_fallback_used = False
         if (not liquid
-                and symbol not in MCX_SYMBOLS                          # NFO only
                 and strike.otm_strike != strike.atm_strike):           # not already ATM
             try:
                 atm_ts = find_option_tradingsymbol(
@@ -510,7 +847,7 @@ def scan_and_signal() -> None:
         # ── Step 8: Evaluate auto-execute guards ───────────────────────────
         # PCR ideal check (reuse telegram_alert logic for consistency)
         from modules.telegram_alert import evaluate_pcr
-        pcr_ideal = True   # default for MCX (no PCR)
+        pcr_ideal = True
         if pcr_val is not None:
             pcr_ideal = evaluate_pcr(pcr_val, signal.direction)["ideal"]
 
@@ -533,7 +870,7 @@ def scan_and_signal() -> None:
                 "auto_ok":            auto_ok,
                 "auto_reason":        auto_reason,
                 "tradingsymbol":      tradingsymbol,
-                "auto_exec_armed":    ENABLE_AUTO_EXECUTE and symbol == "NIFTY",
+                "auto_exec_armed":    ENABLE_AUTO_EXECUTE,
                 "atm_fallback_used":  atm_fallback_used,
             }
             try:
@@ -544,7 +881,7 @@ def scan_and_signal() -> None:
                 logger.error("[%s] Telegram error: %s", symbol, exc)
 
             # ── Step 10: Auto-execute (all 4 guards must pass) ────────────
-            if auto_ok and tradingsymbol and ENABLE_AUTO_EXECUTE and symbol == "NIFTY":
+            if auto_ok and tradingsymbol and ENABLE_AUTO_EXECUTE:
                 try:
                     trade_result = execute_trade(
                         kite          = kite,
@@ -564,8 +901,7 @@ def scan_and_signal() -> None:
                     logger.error("[%s] Auto-execute error: %s", symbol, exc)
 
         else:
-            window_hint = "10:00 AM–3:00 PM" if symbol not in MCX_SYMBOLS else "9:00 AM–11:30 PM"
-            logger.info("[%s] ⏰ Outside alert window (%s) — signal logged only.", symbol, window_hint)
+            logger.info("[%s] ⏰ Outside alert window (10:00 AM–3:00 PM) — signal logged only.", symbol)
 
         # ── Step 11: Log to CSV ────────────────────────────────────────────
         try:
@@ -584,18 +920,14 @@ def scan_and_signal() -> None:
 
 def build_scheduler() -> BlockingScheduler:
     """
-    Schedule scan_and_signal() every 5 minutes across the full combined
-    market window: 9:00 AM – 11:30 PM IST (Mon–Fri).
-
-    The combined window covers both NSE (closes 3:30 PM) and MCX SILVERM
-    (closes 11:30 PM). The per-symbol is_symbol_market_open() check inside
-    the job skips NSE symbols after 3:30 PM automatically — no extra logic needed.
+    Schedule scan_and_signal() every 5 minutes during NSE market hours:
+    9:15 AM – 3:30 PM IST (Mon–Fri).
     """
     scheduler = BlockingScheduler(timezone=IST)
 
     trigger = CronTrigger(
         day_of_week        = "mon-fri",
-        hour               = f"{MCX_OPEN_H}-{MCX_CLOSE_H}",   # 9 – 23 (11 PM)
+        hour               = f"{MARKET_OPEN_H}-{MARKET_CLOSE_H}",   # 9 – 15
         minute             = "0/5",
         timezone           = IST,
     )
@@ -604,35 +936,231 @@ def build_scheduler() -> BlockingScheduler:
         func               = scan_and_signal,
         trigger            = trigger,
         id                 = "signal_scan",
-        name               = "NSE + MCX Signal Scanner",
+        name               = "NSE Signal Scanner",
         misfire_grace_time = 60,
         coalesce           = True,
     )
 
-    # ── End-of-Day Summary jobs ─────────────────────────────────────────────
-    # NSE: 3:20 PM — NSE closes 3:30 PM, GTTs settle by 3:20 PM
-    # MCX: 11:20 PM — MCX SILVERM/GOLDM close 11:30 PM
-    def _nse_eod():
-        from modules.telegram_alert import send_alert
-        send_eod_summary(send_alert, log_csv_path="trade_log.csv")
+    # ── 8:45 AM — Morning Briefing (regime + straddle radar) ───────────────────
+    scheduler.add_job(
+        func    = send_morning_briefing,
+        trigger = CronTrigger(day_of_week="mon-fri", hour=8, minute=45, timezone=IST),
+        id      = "morning_briefing",
+        name    = "Morning Briefing",
+        misfire_grace_time = 300,
+        coalesce           = True,
+    )
 
-    def _mcx_eod():
-        from modules.telegram_alert import send_alert
-        send_eod_summary(send_alert, log_csv_path="trade_log.csv")
+    # ── 8:55 AM — MCX CPR Pre-Market Alerts (MCX opens 9:00 AM) ────────────────
+    # All fire at 08:55 IST, one Telegram per symbol.
+    # ACTIVE (backtest-profitable, ₹87K account):
+    #   GOLDPETAL  : 10 lots · ₹22K margin · ₹10/₹1 move  | 83.9% win, +₹31K/6mo ✅
+    #   GOLDGUINEA :  3 lots · ₹53K margin · ₹3/₹1 move   | 71.9% win, +₹41K/6mo ✅
+    #   CRUDEOILM  :  1 lot  · ₹29K margin · ₹10/₹1 move  | 55.2% win, +₹12K/4mo ✅
+    #   NICKEL     :  1 lot  · ₹49K margin · ₹250/₹1 move  | 76.9% win, +₹21K/4mo  ✅
+    #   SILVERMIC  :  1 lot  · ₹63K margin · ₹1/₹1 move   | 79.5% win, +₹1.22L/9mo ✅
+    #   NATURALGAS :  1 lot  · ₹68K margin · ₹1,250/₹1 move| 80.8% win, +₹69K/4mo  ✅
+    # SUPPRESSED (over budget — silver tripled since 2023):
+    #   SILVERM    :  margin ₹1.25L — exceeds ₹87K capital limit ❌
+
+    def _goldpetal_alert():
+        try:
+            from goldpetal_morning_alert import send_goldpetal_cpr_alert
+            send_goldpetal_cpr_alert()
+        except Exception as exc:
+            logger.error("GOLDPETAL CPR alert failed: %s", exc)
+
+    def _goldguinea_alert():
+        try:
+            from goldguinea_morning_alert import send_goldguinea_cpr_alert
+            send_goldguinea_cpr_alert()
+        except Exception as exc:
+            logger.error("GOLDGUINEA CPR alert failed: %s", exc)
+
+    def _silverm_alert():
+        try:
+            from silverm_morning_alert import send_silverm_cpr_alert
+            send_silverm_cpr_alert()
+        except Exception as exc:
+            logger.error("SILVERM CPR alert failed: %s", exc)
+
+    def _silvermic_alert():
+        try:
+            from silvermic_morning_alert import send_silvermic_cpr_alert
+            send_silvermic_cpr_alert()
+        except Exception as exc:
+            logger.error("SILVERMIC CPR alert failed: %s", exc)
+
+    def _crudeoilm_alert():
+        try:
+            from crudeoilm_morning_alert import send_crudeoilm_cpr_alert
+            send_crudeoilm_cpr_alert()
+        except Exception as exc:
+            logger.error("CRUDEOILM CPR alert failed: %s", exc)
+
+    def _nickel_alert():
+        try:
+            from nickel_morning_alert import send_nickel_cpr_alert
+            send_nickel_cpr_alert()
+        except Exception as exc:
+            logger.error("NICKEL CPR alert failed: %s", exc)
+
+    def _naturalgas_alert():
+        try:
+            from naturalgas_morning_alert import send_naturalgas_cpr_alert
+            send_naturalgas_cpr_alert()
+        except Exception as exc:
+            logger.error("NATURALGAS CPR alert failed: %s", exc)
+
+    def _usdinr_alert():
+        try:
+            from usdinr_morning_alert import send_usdinr_cpr_alert
+            send_usdinr_cpr_alert()
+        except Exception as exc:
+            logger.error("USDINR CPR alert failed: %s", exc)
+
+    for _job_id, _job_name, _job_func in [
+        ("goldpetal_cpr_alert",   "GOLDPETAL CPR Pre-Market Alert",   _goldpetal_alert),
+        ("goldguinea_cpr_alert",  "GOLDGUINEA CPR Pre-Market Alert",  _goldguinea_alert),
+        ("silvermic_cpr_alert",   "SILVERMIC CPR Pre-Market Alert",   _silvermic_alert),
+        # SILVERM suppressed — margin ₹1.25L exceeds ₹87K capital (silver tripled)
+        ("crudeoilm_cpr_alert",   "CRUDEOILM CPR Pre-Market Alert",   _crudeoilm_alert),
+        ("nickel_cpr_alert",      "NICKEL CPR Pre-Market Alert",      _nickel_alert),
+        ("naturalgas_cpr_alert",  "NATURALGAS CPR Pre-Market Alert",  _naturalgas_alert),
+        ("usdinr_cpr_alert",      "USDINR CPR Pre-Market Alert",      _usdinr_alert),
+    ]:
+        scheduler.add_job(
+            func    = _job_func,
+            trigger = CronTrigger(day_of_week="mon-fri", hour=8, minute=55, timezone=IST),
+            id      = _job_id,
+            name    = _job_name,
+            misfire_grace_time = 300,
+            coalesce           = True,
+        )
+
+    # ── 10:02 AM — GOLDPETAL Auto-Execute (checks 09:00–10:00 candle) ───────────
+    # Fetches the first 60-min candle close, compares to CPR levels.
+    # LONG if close > upper_cpr | SHORT if close < lower_cpr | skip if inside.
+    # Places NRML market order when GOLDPETAL_AUTO_EXECUTE = True in autoexec.py.
+    def _goldpetal_autoexec():
+        try:
+            from goldpetal_autoexec import run_goldpetal_autoexec
+            run_goldpetal_autoexec()
+        except Exception as exc:
+            logger.error("GOLDPETAL auto-exec failed: %s", exc)
 
     scheduler.add_job(
-        func    = _nse_eod,
-        trigger = CronTrigger(day_of_week="mon-fri", hour=15, minute=20, timezone=IST),
-        id      = "nse_eod_summary",
-        name    = "NSE End-of-Day Summary",
+        func    = _goldpetal_autoexec,
+        trigger = CronTrigger(day_of_week="mon-fri", hour=10, minute=2, timezone=IST),
+        id      = "goldpetal_autoexec",
+        name    = "GOLDPETAL CPR Auto-Execute",
         misfire_grace_time = 120,
         coalesce           = True,
     )
+
+    # ── 10:05 AM – 4:55 PM — GOLDPETAL Trade Monitor (every 5 min) ─────────────
+    # Polls LTP against SL / target; auto-squares at 16:55 IST if still open.
+    # Sends near-SL and near-target warning Telegrams (once per session each).
+    def _goldpetal_monitor():
+        try:
+            from goldpetal_monitor import run_goldpetal_monitor
+            run_goldpetal_monitor()
+        except Exception as exc:
+            logger.error("GOLDPETAL monitor failed: %s", exc)
+
     scheduler.add_job(
-        func    = _mcx_eod,
-        trigger = CronTrigger(day_of_week="mon-fri", hour=23, minute=20, timezone=IST),
-        id      = "mcx_eod_summary",
-        name    = "MCX End-of-Day Summary",
+        func    = _goldpetal_monitor,
+        trigger = CronTrigger(
+            day_of_week = "mon-fri",
+            hour        = "10-16",
+            minute      = "5,10,15,20,25,30,35,40,45,50,55",
+            timezone    = IST,
+        ),
+        id      = "goldpetal_monitor",
+        name    = "GOLDPETAL Trade Monitor",
+        misfire_grace_time = 60,
+        coalesce           = True,
+    )
+
+    # ── 10:05 AM – 5:55 PM — MCX CPR Monitor: GOLDGUINEA + CRUDEOILM + NICKEL ────
+    # SILVERM excluded — margin ₹1.25L exceeds ₹50K capital limit.
+    # Detects breakout direction from first 1H candle at 10:05.
+    # Then monitors LTP → sends near-SL, near-target, target/SL hit, hourly pulse.
+    # EOD square-off reminder fires at 17:55 IST (user's 6 PM cutoff).
+    def _mcx_cpr_monitor():
+        try:
+            from mcx_cpr_monitor import run_mcx_cpr_monitor
+            run_mcx_cpr_monitor()
+        except Exception as exc:
+            logger.error("MCX CPR monitor failed: %s", exc)
+
+    scheduler.add_job(
+        func    = _mcx_cpr_monitor,
+        trigger = CronTrigger(
+            day_of_week = "mon-fri",
+            hour        = "9-21",
+            minute      = "5,10,15,20,25,30,35,40,45,50,55",
+            timezone    = IST,
+        ),
+        id      = "mcx_cpr_monitor",
+        name    = "MCX CPR Monitor (GOLDGUINEA + CRUDEOILM + NICKEL)",
+        misfire_grace_time = 60,
+        coalesce           = True,
+    )
+
+    # ── 9:45 AM – 4:55 PM — USDINR CPR Monitor (every 5 min) ────────────────────
+    # NSE CDS session 09:00–17:00 IST. EOD square-off reminder at 16:45.
+    def _usdinr_cpr_monitor():
+        try:
+            from usdinr_cpr_monitor import run_usdinr_cpr_monitor
+            run_usdinr_cpr_monitor()
+        except Exception as exc:
+            logger.error("USDINR CPR monitor failed: %s", exc)
+
+    scheduler.add_job(
+        func    = _usdinr_cpr_monitor,
+        trigger = CronTrigger(
+            day_of_week = "mon-fri",
+            hour        = "9-16",
+            minute      = "5,10,15,20,25,30,35,40,45,50,55",
+            timezone    = IST,
+        ),
+        id      = "usdinr_cpr_monitor",
+        name    = "USDINR CPR Monitor",
+        misfire_grace_time = 60,
+        coalesce           = True,
+    )
+
+    # ── 9:15 AM — Straddle exit reminder (if today is a result day) ────────────
+    scheduler.add_job(
+        func    = send_exit_reminder,
+        trigger = CronTrigger(day_of_week="mon-fri", hour=9, minute=15, timezone=IST),
+        id      = "exit_reminder",
+        name    = "Straddle Exit Reminder",
+        misfire_grace_time = 120,
+        coalesce           = True,
+    )
+
+    # ── 3:00 PM — Pre-event straddle alert (for tomorrow's results) ────────────
+    scheduler.add_job(
+        func    = send_straddle_prealert,
+        trigger = CronTrigger(day_of_week="mon-fri", hour=15, minute=0, timezone=IST),
+        id      = "straddle_prealert",
+        name    = "Straddle Pre-Alert",
+        misfire_grace_time = 120,
+        coalesce           = True,
+    )
+
+    # ── 3:20 PM — End-of-Day Summary ───────────────────────────────────────────
+    def _eod():
+        from modules.telegram_alert import send_alert
+        send_eod_summary(send_alert, log_csv_path="trade_log.csv")
+
+    scheduler.add_job(
+        func    = _eod,
+        trigger = CronTrigger(day_of_week="mon-fri", hour=15, minute=20, timezone=IST),
+        id      = "eod_summary",
+        name    = "NSE End-of-Day Summary",
         misfire_grace_time = 120,
         coalesce           = True,
     )
@@ -645,21 +1173,34 @@ def build_scheduler() -> BlockingScheduler:
 def print_banner() -> None:
     print("\n" + "=" * 60)
     print("  🟢  NiftySignalBot — OPTIONS SIGNAL SYSTEM")
-    exec_mode = "⚡ AUTO-EXECUTE (NIFTY) + MONITOR" if ENABLE_AUTO_EXECUTE else "🔒 SIGNAL-ONLY (alert mode)"
+    exec_mode = "⚡ AUTO-EXECUTE + MONITOR" if ENABLE_AUTO_EXECUTE else "🔒 SIGNAL-ONLY (alert mode)"
     print(f"  Mode: {exec_mode}")
     print("=" * 60)
-    print(f"  Symbols   : {', '.join(SYMBOLS)}")
-    print(f"  NSE hours : 9:15 AM – 3:30 PM  | Alerts: 10:00 AM–3:00 PM (skips 9:15–10:00 opening)")
-    print(f"  MCX hours : 9:00 AM – 11:30 PM | Alerts: full session (SILVERM, GOLDM)")
-    print(f"  Scan      : Every {SCAN_INTERVAL_MINUTES} min (Mon–Fri)")
-    print(f"  Chart data: yfinance (^NSEI, ^NSEBANK) + Kite MCX historical")
-    print(f"  OC + LTP  : Kite Connect NFO API (NIFTY/BANKNIFTY) | MCX: spot-only")
-    print(f"  Budget    : NIFTY/BANKNIFTY ₹10k–₹20k/lot | SILVERM ~₹5k–₹15k | GOLDM <₹50k/lot")
-    print(f"  Guards    : Duplicate check | Margin | Liquidity | Conviction+PCR")
-    exec_status = "⚡ ENABLED" if ENABLE_AUTO_EXECUTE else "🔒 DISABLED (alert-only)"
+    print(f"  ACTIVE STRATEGIES (backtest-profitable):")
+    print(f"    MCX CPR  : GOLDPETAL 10L (83.9% win) · GOLDGUINEA 2L (71.9%) · CRUDEOILM 1L (55.2%) · NICKEL 1L (41.6% / 3.73x)")
+    print(f"    CDS CPR  : USDINR 10L")
+    print(f"    Straddle : NIFTY50 earnings — DTE<=5 gate (T1/T2 stocks)")
+    print(f"  SUPPRESSED STRATEGIES (loss-making / over-budget):")
+    print(f"    NSE opts : NIFTY -59K · BANKNIFTY -45K  (12mo, 31-38% win — choppy 2025)")
+    print(f"    SILVERM  : margin 1.25L > 50K capital limit (silver tripled)")
+    exec_status = "ENABLED" if ENABLE_AUTO_EXECUTE else "DISABLED (alert-only)"
     print(f"  Auto-exec : {exec_status}")
-    print(f"  OI Tracker: data/oi_tracker.db (20-min rolling trend)")
-    print(f"  Log file  : trade_log.csv")
+    print("─" * 60)
+    print(f"  8:45 AM   : Morning briefing (regime + straddle radar)")
+    print(f"  8:55 AM   : GOLDPETAL CPR pre-market alert  [83.9% win / 0 red months]")
+    print(f"  8:55 AM   : GOLDGUINEA CPR pre-market alert [71.9% win / 0 red months]")
+    print(f"  8:55 AM   : CRUDEOILM CPR pre-market alert  [55.2% win / 4.33x payoff]")
+    print(f"  8:55 AM   : NICKEL CPR pre-market alert     [41.6% win / 3.73x payoff]")
+    print(f"  8:55 AM   : USDINR CPR pre-market alert (NSE CDS)")
+    print(f"  9:15 AM   : Straddle exit reminder (if result day)")
+    print(f"  10:02 AM  : GOLDPETAL auto-exec (10:00 candle check)")
+    print(f"  10:05 AM+ : GOLDPETAL monitor every 5 min (SL/target/EOD)")
+    print(f"  9:45 AM+  : GOLDGUINEA + NICKEL + CRUDEOILM CPR monitor (LTP vs CPR)")
+    print(f"  9:45 AM+  : USDINR signal reminders (LTP vs CPR, EOD 16:45)")
+    print(f"  3:00 PM   : Pre-event straddle alert (tomorrow's earnings, DTE<=5 only)")
+    print(f"  3:20 PM   : EOD summary")
+    print("─" * 60)
+    print(f"  OI Tracker: data/oi_tracker.db | Log: trade_log.csv")
     print("=" * 60 + "\n")
 
 
@@ -685,9 +1226,16 @@ def main() -> None:
     init_oi_db()
     logger.info("OI tracker DB ready.")
 
+    # ── Refresh earnings calendar (runs fast, cached 24h) ──────────────────
+    try:
+        refresh_earnings()
+        logger.info("Earnings calendar refreshed.")
+    except Exception as exc:
+        logger.warning("Earnings calendar refresh failed (non-fatal): %s", exc)
+
     if ENABLE_AUTO_EXECUTE:
         logger.warning(
-            "⚡ AUTO-EXECUTE is ENABLED — NIFTY BUY orders will be placed when all guards pass!"
+            "⚡ AUTO-EXECUTE is ENABLED — BUY orders will be placed when all guards pass!"
         )
     else:
         logger.info("🔒 Auto-execute is DISABLED — alert-only mode.")

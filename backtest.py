@@ -140,7 +140,7 @@ MIN_PREMIUM = 15.0   # ₹ per share
 # Set to None to disable each filter independently.
 VIX_MIN      = 11.0   # skip if India VIX below this (market too calm)
 VIX_MAX      = 30.0   # skip if India VIX above this (IV crush risk)
-VIX_RANK_MAX = 70.0   # skip if VIX rank > 70% (already spiked — IV mean reverts)
+VIX_RANK_MAX = 85.0   # skip if VIX rank > 70% (already spiked — IV mean reverts)
 
 # Minimum DTE to enter a new trade.
 #
@@ -264,11 +264,15 @@ def rolling_vol(close: pd.Series, window: int = HIST_VOL_WINDOW) -> pd.Series:
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
 
-def fetch_data(symbol: str) -> Optional[pd.DataFrame]:
+def fetch_data(symbol: str, days: int = 60) -> Optional[pd.DataFrame]:
     ticker = YF_TICKERS[symbol]
-    print(f"  Downloading {symbol} ({ticker}) — 1H, 60 days …")
-    df = yf.download(tickers=ticker, period="60d", interval="1h",
-                     progress=False, auto_adjust=True)
+    # yfinance 1H supports up to 730 days; use start/end for >60d
+    from datetime import date, timedelta
+    end_dt   = date.today()
+    start_dt = end_dt - timedelta(days=days)
+    print(f"  Downloading {symbol} ({ticker}) — 1H, {days} days …")
+    df = yf.download(tickers=ticker, start=str(start_dt), end=str(end_dt),
+                     interval="1h", progress=False, auto_adjust=True)
     if df is None or df.empty:
         print(f"  ❌  No data for {symbol}")
         return None
@@ -811,6 +815,8 @@ def main():
     parser = argparse.ArgumentParser(description="NiftySignalBot Backtester")
     parser.add_argument("--symbol",       choices=["NIFTY", "BANKNIFTY", "BOTH"],
                         default="BOTH",   help="Symbol to backtest")
+    parser.add_argument("--days",         type=int, default=60,
+                        help="Lookback in calendar days (max 730 for 1H yfinance, default: 60)")
     parser.add_argument("--show-medium",  action="store_true",  default=True,
                         help="Also show MEDIUM conviction trades (default: on)")
     parser.add_argument("--no-filter-hours", action="store_true",
@@ -848,7 +854,7 @@ def main():
     # ── Banner ────────────────────────────────────────────────────────────
     fourth_ind_name = "VWAP via ETF proxy" if use_vwap else "EMA50"
     print("\n" + "═" * 64)
-    print("  NiftySignalBot — Signal Backtest (last ~60 days)")
+    print(f"  NiftySignalBot — Signal Backtest (last ~{args.days} days)")
     if use_vwap:
         print("  Indicators: EMA9/21 × RSI(14) × VWAP(ETF) × SuperTrend(10,3)")
         print("  4th indicator: VWAP — computed on NIFTYBEES.NS / BANKBEES.NS ETFs")
@@ -870,7 +876,7 @@ def main():
 
     for symbol in symbols:
         print(f"── {symbol} ──────────────────────────────────────────")
-        df = fetch_data(symbol)
+        df = fetch_data(symbol, days=args.days)
         if df is None:
             continue
 

@@ -322,8 +322,17 @@ def get_results_this_week(days: int = 7) -> list[dict]:
 
 
 def get_results_today() -> list[dict]:
-    """Return stocks with results announced today (exit reminder day)."""
+    """Return stocks with results announced today (straddle buy day — results after market)."""
     return get_results_on(date.today())
+
+
+def get_results_yesterday() -> list[dict]:
+    """Return stocks with results announced yesterday (exit reminder day — gap already happened)."""
+    yesterday = date.today() - timedelta(days=1)
+    # Skip back past weekend — Friday results exit on Monday morning
+    while yesterday.weekday() >= 5:
+        yesterday -= timedelta(days=1)
+    return get_results_on(yesterday)
 
 
 def is_result_season() -> bool:
