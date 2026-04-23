@@ -501,6 +501,27 @@ def send_straddle_prealert() -> None:
 
             result_date_str = _date.fromisoformat(ev["date"]).strftime("%d %b %Y")
 
+            # ── Weekend / expiry warnings ─────────────────────────────────
+            is_friday   = result_date.weekday() == 4
+            next_trading = result_date + __import__("datetime").timedelta(days=3 if is_friday else 1)
+            is_expiry_next = (_last_thursday_of_month(result_date) == next_trading)
+
+            weekend_warn = (
+                f"\n⚠️ <b>FRIDAY RESULTS — Weekend theta risk</b>\n"
+                f"  Both legs decay Sat + Sun (3 calendar days held).\n"
+                f"  Outlay is higher-stakes than weekday results.\n"
+            ) if is_friday else ""
+
+            expiry_warn = (
+                f"\n🔴 <b>EXPIRY {next_trading.strftime('%a %d %b')} — Exit by 10:00 AM!</b>\n"
+                f"  Winning leg has near-zero time value on expiry day.\n"
+                f"  Do NOT wait until 11:15 AM — gamma risk increases fast.\n"
+                f"  Exit winner at 10:00 AM sharp.\n"
+            ) if is_expiry_next else ""
+
+            exit_day_str = next_trading.strftime("%a %d %b")
+            winner_exit  = "10:00 AM" if is_expiry_next else "11:15 AM"
+
             msg = (
                 f"🔔 <b>STRADDLE ALERT — BUY NOW</b>\n"
                 f"{'━' * 34}\n"
@@ -518,8 +539,9 @@ def send_straddle_prealert() -> None:
                 f"🎯 <b>Trade Plan</b>\n"
                 f"  <b>TODAY before 3:20 PM:</b>\n"
                 f"    Buy {K} CE  +  Buy {K} PE\n"
-                f"  <b>TOMORROW open:</b> Sell losing leg at market\n"
-                f"  <b>TOMORROW 11:15 AM:</b> Exit winning leg ← HARD EXIT\n\n"
+                f"  <b>{exit_day_str} open:</b> Sell losing leg at market\n"
+                f"  <b>{exit_day_str} {winner_exit}:</b> Exit winning leg ← HARD EXIT\n"
+                f"{weekend_warn}{expiry_warn}\n"
                 f"{'━' * 34}\n"
                 f"⚠️ <b>BUY BEFORE CLOSE — {win_2h}% win rate | ₹{avg_pnl:,.0f} avg</b>"
             )
@@ -535,23 +557,52 @@ def send_exit_reminder() -> None:
     9:15 AM job — if yesterday was a results day for any tracked stock,
     send an exit reminder: sell losing leg at open + exit winner at 11:15 AM.
     Results are announced after market close, so the gap happens the NEXT morning.
+
+    Special cases:
+    - Expiry today: exit winner by 10:00 AM (gamma risk spikes near expiry)
+    - Weekend held: both legs have 3 days of extra theta — loser may be near zero
     """
     from datetime import date as _date
     yesterday_events = get_results_yesterday()
     if not yesterday_events:
         return
+
+    today = _date.today()
+    is_expiry_today = (_last_thursday_of_month(today) == today)
+
     for ev in yesterday_events:
         sym = ev["symbol"]
+
+        # Was this a Friday results? (held over weekend)
+        result_date   = _date.fromisoformat(ev["date"])
+        held_weekend  = result_date.weekday() == 4   # Friday
+
+        if is_expiry_today:
+            winner_exit  = "10:00 AM"
+            expiry_note  = (
+                f"\n🔴 <b>EXPIRY TODAY — Exit winner by 10:00 AM sharp!</b>\n"
+                f"  Time value is near zero. Gamma risk spikes after 10 AM.\n"
+                f"  Do NOT wait until 11:15 AM today.\n"
+            )
+        else:
+            winner_exit  = "11:15 AM"
+            expiry_note  = ""
+
+        weekend_note = (
+            f"\n⚠️ <b>Weekend held — both legs decayed 3 days.</b>\n"
+            f"  Loser premium may be near zero — sell quickly at open.\n"
+        ) if held_weekend else ""
+
         msg = (
-            f"⏰ <b>STRADDLE EXIT REMINDER — {sym}</b>\n"
+            f"⏰ <b>STRADDLE EXIT — {sym}</b>\n"
             f"{'━' * 34}\n"
-            f"Results day! Here's your checklist:\n\n"
-            f"  ✅ <b>RIGHT NOW at open:</b>\n"
+            f"Results were last night. Gap is open. Act now!\n"
+            f"{weekend_note}{expiry_note}\n"
+            f"  ✅ <b>RIGHT NOW at open (9:15 AM):</b>\n"
             f"     Sell the LOSING leg at MARKET\n\n"
-            f"  ⏰ <b>11:15 AM — HARD EXIT:</b>\n"
+            f"  ⏰ <b>{winner_exit} — HARD EXIT:</b>\n"
             f"     Exit the winning leg regardless of price\n"
-            f"     (2H exit = 2× better than holding to EOD)\n\n"
-            f"  ❌ Do NOT hold to EOD — IV crush kills the premium\n"
+            f"     Do NOT hold to EOD — IV crush kills the premium\n"
             f"{'━' * 34}"
         )
         _send_telegram_raw(msg)
